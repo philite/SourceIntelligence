@@ -37,6 +37,7 @@ var indexCmd = &cobra.Command{
 		moduleName, _ := cmd.Flags().GetString("module")
 		analyzerDir, _ := cmd.Flags().GetString("analyzer-dir")
 		semantic, _ := cmd.Flags().GetBool("semantic")
+		fullK2, _ := cmd.Flags().GetBool("full-k2")
 		
 		fmt.Printf("Indexing project: %s\n", projectPath)
 		
@@ -44,12 +45,14 @@ var indexCmd = &cobra.Command{
 		a := analyzer.NewAnalyzer(analyzerDir)
 		
 		// Analyze project
-		if semantic {
+		if fullK2 {
+			fmt.Println("Running full K2 semantic analyzer (this may take a while)...")
+		} else if semantic {
 			fmt.Println("Running PSI-enhanced analyzer...")
 		} else {
 			fmt.Println("Running Kotlin analyzer...")
 		}
-		graph, err := a.AnalyzeProject(projectPath, moduleName, semantic)
+		graph, err := a.AnalyzeProject(projectPath, moduleName, semantic, fullK2)
 		if err != nil {
 			return fmt.Errorf("analysis failed: %w", err)
 		}
@@ -174,6 +177,7 @@ func init() {
 	indexCmd.Flags().String("module", "", "Specific module to analyze")
 	indexCmd.Flags().String("analyzer-dir", "../analyzer", "Path to analyzer directory (containing gradlew)")
 	indexCmd.Flags().Bool("semantic", false, "Use PSI-enhanced semantic analysis (slower but more accurate)")
+	indexCmd.Flags().Bool("full-k2", false, "Use full K2 semantic analysis with classpath (slowest but most accurate)")
 	
 	// Find command flags
 	findCmd.Flags().String("type", "", "Filter by symbol type (e.g., ViewModel, UseCase)")
