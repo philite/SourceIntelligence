@@ -1,5 +1,6 @@
 plugins {
     kotlin("jvm") version "2.1.21"
+    kotlin("plugin.serialization") version "2.1.21"
     application
 }
 
@@ -72,8 +73,12 @@ tasks.jar {
     manifest {
         attributes["Main-Class"] = "com.sourceintel.analyzer.MainKt"
     }
-    
-    // Create fat JAR for distribution
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
+    // Enable zip64 for large archives
+    isZip64 = true
 }
+
+// Use application plugin's distribution instead of fat JAR
+tasks.named<JavaExec>("run") {
+    standardInput = System.`in`
+}
+
