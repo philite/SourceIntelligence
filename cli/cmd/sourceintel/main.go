@@ -9,6 +9,7 @@ import (
 
 	"github.com/sourceintel/cli/internal/analyzer"
 	"github.com/sourceintel/cli/internal/memgraph"
+	mcp_server "github.com/sourceintel/cli/internal/mcp"
 	"github.com/sourceintel/cli/internal/query"
 	"github.com/spf13/cobra"
 )
@@ -159,10 +160,27 @@ var findCmd = &cobra.Command{
 var mcpCmd = &cobra.Command{
 	Use:   "mcp",
 	Short: "Start MCP server for AI agent integration",
-	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Starting MCP server on stdio...")
-		fmt.Println("MCP server implementation coming in Phase 4")
-		// TODO: Start MCP server
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Fprintln(os.Stderr, "Starting MCP server on stdio...")
+		
+		// Connect to Memgraph
+		// Note: We use a separate context for the connection that lives as long as the server
+		client, err := memgraph.NewClient(memgraph.Config{
+			URI:      memgraphURI,
+			Username: memgraphUser,
+			Password: memgraphPassword,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to connect to Memgraph: %w", err)
+		}
+		defer client.Close(context.Background())
+
+		// Start MCP server
+		srv := mcp_server.NewServer(client)
+		if err := srv.Start(); err != nil {
+			return fmt.Errorf("server error: %w", err)
+		}
+		return nil
 	},
 }
 
