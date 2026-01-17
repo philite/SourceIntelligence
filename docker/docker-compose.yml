@@ -1,11 +1,21 @@
 services:
   memgraph:
     image: memgraph/memgraph-mage:latest
+    container_name: memgraph-db
     ports:
-    # - "7687:7687"   # Bolt protocol
-      - "7687:7687"
-      - "7444:7444"
+      - "7687:7687"   # Bolt protocol
+      - "7444:7444"   # WebSocket for Lab
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+      - memgraph_log:/var/log/memgraph
+    command: ["--log-level=WARNING"]
+    healthcheck:
+      test: ["CMD", "mg_client", "--host", "localhost", "--port", "7687", "--execute", "RETURN 1;"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     pull_policy: always
+
   lab:
     image: memgraph/lab:latest
     container_name: memgraph-lab
@@ -17,15 +27,6 @@ services:
       - QUICK_CONNECT_MG_HOST=memgraph
       - QUICK_CONNECT_MG_PORT=7687
     pull_policy: always
-    volumes:
-      - memgraph_data:/var/lib/memgraph
-      - memgraph_log:/var/log/memgraph
-    command: ["--log-level=WARNING"]
-    healthcheck:
-      test: ["CMD", "mg_client", "--host", "localhost", "--port", "7687", "-u", "memgraph", "-p", "sourceintel", "--execute", "RETURN 1;"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
 volumes:
   memgraph_data:
