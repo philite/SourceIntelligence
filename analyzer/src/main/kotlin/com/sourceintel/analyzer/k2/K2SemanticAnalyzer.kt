@@ -8,10 +8,8 @@ import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.psi.*
-import org.jetbrains.kotlin.psi.psiUtil.getChildrenOfType
 import java.nio.file.Path
 import java.time.Instant
-import kotlin.io.path.absolutePathString
 import kotlin.io.path.exists
 import kotlin.io.path.name
 import kotlin.io.path.walk
@@ -19,22 +17,24 @@ import kotlin.io.path.walk
 private val logger = KotlinLogging.logger {}
 
 /**
- * PSI-enhanced Kotlin analyzer.
+ * PSI-enhanced Kotlin analyzer with external type placeholder support.
  * 
- * Uses Kotlin PSI (Program Structure Interface) for more accurate parsing than regex:
+ * Uses Kotlin PSI (Program Structure Interface) for accurate parsing:
  * - Proper class hierarchy detection
- * - Function signature extraction
+ * - Function signature extraction with parameter types
  * - Property type extraction
  * - Call relationship extraction from AST
+ * - Creates placeholder nodes for external/library types
  * 
- * This is a simpler alternative to full K2 FIR analysis that still provides
- * much better accuracy than regex-based parsing.
+ * This enables inheritance queries like:
+ *   MATCH (c:Class)-[:EXTENDS]->(p:ExternalType) RETURN c.name, p.fqn
  */
 class K2SemanticAnalyzer(
     private val projectPath: Path
 ) {
     private var nodeIdCounter = 0
     private val nodesByFqn = mutableMapOf<String, String>()
+    private val externalTypes = mutableSetOf<String>() // Track unique external types
     private lateinit var environment: KotlinCoreEnvironment
 
     fun analyze(moduleName: String? = null): CodeGraph {
@@ -70,6 +70,12 @@ class K2SemanticAnalyzer(
                 }
             }
             
+            // Create placeholder nodes for all external types
+            createExternalTypeNodes(nodes)
+            
+            // Now fix up relationships to point to actual node IDs
+            fixupRelationships(relationships)
+            
             logger.info { "PSI analysis complete: ${nodes.size} nodes, ${relationships.size} relationships" }
             
         } catch (e: Exception) {
@@ -89,6 +95,54 @@ class K2SemanticAnalyzer(
         )
     }
     
+    /**
+     * Creates placeholder TypeNode objects for all external types referenced.
+     */
+    private fun createExternalTypeNodes(nodes: MutableList<GraphNode>) {
+        for (externalFqn in externalTypes) {
+            if (externalFqn !in nodesByFqn) {
+                val name = externalFqn.substringAfterLast('.')
+                val typeNode = TypeNode(
+                    id = nextId(),
+                    labels = listOf("Type", "Class", "ExternalType"),
+                    properties = mapOf("isExternal" to "true"),
+                    name = name,
+                    fqn = externalFqn,
+                    kind = TypeKind.CLASS,
+                    file = "",
+                    line = 0
+                )
+                nodes.add(typeNode)
+                nodesByFqn[externalFqn] = typeNode.id
+            }
+        }
+        logger.info { "Created ${externalTypes.size} external type placeholders" }
+    }
+    
+    /**
+     * Updates relationship endpoints to use actual node IDs instead of placeholders.
+     */
+    private fun fixupRelationships(relationships: MutableList<GraphRelationship>) {
+        val fixed = relationships.map { rel ->
+            var startId = rel.startNodeId
+            var endId = rel.endNodeId
+            
+            // Resolve "pending:xxx" references
+            if (startId.startsWith("pending:")) {
+                val fqn = startId.removePrefix("pending:")
+                startId = nodesByFqn[fqn] ?: startId
+            }
+            if (endId.startsWith("pending:")) {
+                val fqn = endId.removePrefix("pending:")
+                endId = nodesByFqn[fqn] ?: endId
+            }
+            
+            rel.copy(startNodeId = startId, endNodeId = endId)
+        }
+        relationships.clear()
+        relationships.addAll(fixed)
+    }
+    
     private fun analyzeFile(
         ktFile: KtFile,
         filePath: String,
@@ -96,7 +150,11 @@ class K2SemanticAnalyzer(
         relationships: MutableList<GraphRelationship>
     ) {
         val packageName = ktFile.packageFqName.asString()
-        val relativePath = projectPath.relativize(Path.of(filePath)).toString()
+        val relativePath = try {
+            projectPath.relativize(Path.of(filePath)).toString()
+        } catch (e: Exception) {
+            filePath
+        }
         
         // Create file node
         val fileNode = FileNode(
@@ -110,24 +168,38 @@ class K2SemanticAnalyzer(
         
         // Create package node
         if (packageName.isNotEmpty()) {
-            val packageNode = PackageNode(
-                id = nextId(),
-                properties = emptyMap(),
-                name = packageName.substringAfterLast('.'),
-                fqn = packageName
-            )
-            nodes.add(packageNode)
+            val packageKey = "pkg:$packageName"
+            val packageNodeId = nodesByFqn[packageKey] ?: run {
+                val packageNode = PackageNode(
+                    id = nextId(),
+                    properties = emptyMap(),
+                    name = packageName.substringAfterLast('.'),
+                    fqn = packageName
+                )
+                nodes.add(packageNode)
+                nodesByFqn[packageKey] = packageNode.id
+                packageNode.id
+            }
+            
             relationships.add(GraphRelationship(
                 id = nextId(),
                 type = RelTypes.CONTAINS,
-                startNodeId = packageNode.id,
+                startNodeId = packageNodeId,
                 endNodeId = fileNode.id
             ))
         }
         
+        // Collect imports for type resolution
+        val imports = ktFile.importDirectives.mapNotNull { import ->
+            val fqn = import.importedFqName?.asString()
+            if (fqn != null && import.alias == null) {
+                fqn.substringAfterLast('.') to fqn
+            } else null
+        }.toMap()
+        
         // Analyze all declarations
         for (declaration in ktFile.declarations) {
-            analyzeDeclaration(declaration, fileNode, packageName, nodes, relationships)
+            analyzeDeclaration(declaration, fileNode, packageName, imports, nodes, relationships)
         }
     }
     
@@ -135,13 +207,14 @@ class K2SemanticAnalyzer(
         declaration: KtDeclaration,
         fileNode: FileNode,
         packageName: String,
+        imports: Map<String, String>,
         nodes: MutableList<GraphNode>,
         relationships: MutableList<GraphRelationship>
     ) {
         when (declaration) {
-            is KtClassOrObject -> analyzeClass(declaration, fileNode, packageName, nodes, relationships)
-            is KtNamedFunction -> analyzeFunction(declaration, fileNode, packageName, nodes, relationships, null)
-            is KtProperty -> analyzeProperty(declaration, fileNode, packageName, nodes, relationships, null)
+            is KtClassOrObject -> analyzeClass(declaration, fileNode, packageName, imports, nodes, relationships)
+            is KtNamedFunction -> analyzeFunction(declaration, fileNode, packageName, imports, nodes, relationships, null)
+            is KtProperty -> analyzeProperty(declaration, fileNode, packageName, imports, nodes, relationships, null)
         }
     }
     
@@ -149,6 +222,7 @@ class K2SemanticAnalyzer(
         ktClass: KtClassOrObject,
         fileNode: FileNode,
         packageName: String,
+        imports: Map<String, String>,
         nodes: MutableList<GraphNode>,
         relationships: MutableList<GraphRelationship>
     ) {
@@ -178,7 +252,7 @@ class K2SemanticAnalyzer(
             }
             if (isData) add("DataClass")
             if (isSealed) add("SealedClass")
-            // Architecture pattern detection
+            // Architecture patterns
             when {
                 name.endsWith("ViewModel") -> add("ViewModel")
                 name.endsWith("UseCase") -> add("UseCase")
@@ -220,14 +294,35 @@ class K2SemanticAnalyzer(
         ktClass.superTypeListEntries.forEach { superType ->
             val parentRef = superType.typeReference?.text?.substringBefore('<')?.trim()
             if (parentRef != null && parentRef.isNotEmpty()) {
-                // Determine if this is a class extension (has constructor call) or interface implementation
+                // Resolve FQN using imports
+                val parentFqn = resolveTypeFqn(parentRef, imports, packageName)
+                
+                // Get or create external type node ID
+                val parentNodeId = nodesByFqn[parentFqn] ?: run {
+                    // Create external type placeholder immediately
+                    val extName = parentFqn.substringAfterLast('.')
+                    val extNode = TypeNode(
+                        id = nextId(),
+                        labels = listOf("Type", "Class", "ExternalType"),
+                        properties = mapOf("isExternal" to "true"),
+                        name = extName,
+                        fqn = parentFqn,
+                        kind = TypeKind.CLASS,
+                        file = "",
+                        line = 0
+                    )
+                    nodes.add(extNode)
+                    nodesByFqn[parentFqn] = extNode.id
+                    extNode.id
+                }
+                
                 val isClassExtension = superType is KtSuperTypeCallEntry
                 relationships.add(GraphRelationship(
                     id = nextId(),
                     type = if (isClassExtension) RelTypes.EXTENDS else RelTypes.IMPLEMENTS,
                     startNodeId = typeNode.id,
-                    endNodeId = "unresolved:$parentRef",
-                    properties = mapOf("parentName" to parentRef)
+                    endNodeId = parentNodeId,
+                    properties = mapOf("parentFqn" to parentFqn)
                 ))
             }
         }
@@ -235,13 +330,13 @@ class K2SemanticAnalyzer(
         // Analyze class members
         ktClass.declarations.forEach { member ->
             when (member) {
-                is KtNamedFunction -> analyzeFunction(member, fileNode, fqn, nodes, relationships, typeNode)
-                is KtProperty -> analyzeProperty(member, fileNode, fqn, nodes, relationships, typeNode)
-                is KtClassOrObject -> analyzeClass(member, fileNode, fqn, nodes, relationships) // Nested class
+                is KtNamedFunction -> analyzeFunction(member, fileNode, fqn, imports, nodes, relationships, typeNode)
+                is KtProperty -> analyzeProperty(member, fileNode, fqn, imports, nodes, relationships, typeNode)
+                is KtClassOrObject -> analyzeClass(member, fileNode, fqn, imports, nodes, relationships)
             }
         }
         
-        // Analyze primary constructor properties
+        // Constructor parameters
         ktClass.primaryConstructorParameters.forEach { param ->
             if (param.hasValOrVar()) {
                 val propName = param.name ?: return@forEach
@@ -271,10 +366,47 @@ class K2SemanticAnalyzer(
         }
     }
     
+    /**
+     * Resolves a simple type name to its FQN using imports.
+     */
+    private fun resolveTypeFqn(typeName: String, imports: Map<String, String>, packageName: String): String {
+        // Check explicit imports first
+        imports[typeName]?.let { return it }
+        
+        // Check Kotlin standard library types
+        val kotlinStdTypes = mapOf(
+            "String" to "kotlin.String",
+            "Int" to "kotlin.Int",
+            "Long" to "kotlin.Long",
+            "Boolean" to "kotlin.Boolean",
+            "Any" to "kotlin.Any",
+            "Unit" to "kotlin.Unit",
+            "List" to "kotlin.collections.List",
+            "Map" to "kotlin.collections.Map",
+            "Set" to "kotlin.collections.Set"
+        )
+        kotlinStdTypes[typeName]?.let { return it }
+        
+        // Check for star imports in common packages
+        val commonPackages = listOf(
+            "kotlin",
+            "kotlin.collections",
+            "kotlin.io",
+            packageName // Same package
+        )
+        
+        // If there's a dot, it's already qualified
+        if ('.' in typeName) return typeName
+        
+        // Default: assume same package or unresolved external
+        return if (packageName.isNotEmpty()) "$packageName.$typeName" else typeName
+    }
+    
     private fun analyzeFunction(
         function: KtNamedFunction,
         fileNode: FileNode,
         containerFqn: String,
+        imports: Map<String, String>,
         nodes: MutableList<GraphNode>,
         relationships: MutableList<GraphRelationship>,
         parentNode: GraphNode?
@@ -337,6 +469,7 @@ class K2SemanticAnalyzer(
         property: KtProperty,
         fileNode: FileNode,
         containerFqn: String,
+        imports: Map<String, String>,
         nodes: MutableList<GraphNode>,
         relationships: MutableList<GraphRelationship>,
         parentNode: GraphNode?
@@ -358,7 +491,6 @@ class K2SemanticAnalyzer(
         )
         nodes.add(fieldNode)
         
-        // Link to parent
         val linkTo = parentNode ?: fileNode
         relationships.add(GraphRelationship(
             id = nextId(),
@@ -374,13 +506,11 @@ class K2SemanticAnalyzer(
         relationships: MutableList<GraphRelationship>
     ) {
         expression.accept(object : KtTreeVisitorVoid() {
-            override fun visitCallExpression(expression: KtCallExpression) {
-                super.visitCallExpression(expression)
+            override fun visitCallExpression(callExpr: KtCallExpression) {
+                super.visitCallExpression(callExpr)
                 
-                val calleeRef = expression.calleeExpression
-                val calleeName = when (calleeRef) {
+                val calleeName = when (val calleeRef = callExpr.calleeExpression) {
                     is KtNameReferenceExpression -> calleeRef.getReferencedName()
-                    is KtDotQualifiedExpression -> calleeRef.selectorExpression?.text
                     else -> calleeRef?.text
                 }
                 
@@ -389,7 +519,7 @@ class K2SemanticAnalyzer(
                         id = nextId(),
                         type = RelTypes.CALLS,
                         startNodeId = callerNode.id,
-                        endNodeId = "unresolved:$calleeName",
+                        endNodeId = "call:$calleeName",
                         properties = mapOf("calleeName" to calleeName)
                     ))
                 }

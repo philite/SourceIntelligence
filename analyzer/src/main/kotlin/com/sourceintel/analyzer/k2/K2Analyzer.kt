@@ -22,6 +22,8 @@ class K2Analyzer(
     private val projectPath: Path
 ) {
     private var nodeIdCounter = 0
+    private val nodesByFqn = mutableMapOf<String, String>()  // FQN -> nodeId
+    private val externalTypes = mutableMapOf<String, String>()  // parentName -> nodeId
     
     fun analyze(moduleName: String? = null): CodeGraph {
         logger.info { "Starting analysis of: $projectPath" }
@@ -43,6 +45,22 @@ class K2Analyzer(
                 logger.warn { "Failed to analyze file $file: ${e.message}" }
             }
         }
+        
+        // Create ExternalType nodes for unresolved types
+        externalTypes.forEach { (name, nodeId) ->
+            val extNode = TypeNode(
+                id = nodeId,
+                labels = listOf("Type", "Class", "ExternalType"),
+                properties = mapOf("isExternal" to "true"),
+                name = name,
+                fqn = "external.$name",
+                kind = TypeKind.CLASS,
+                file = "",
+                line = 0
+            )
+            nodes.add(extNode)
+        }
+        logger.info { "Created ${externalTypes.size} external type nodes" }
         
         val meta = GraphMeta(
             language = "kotlin",
@@ -236,13 +254,14 @@ class K2Analyzer(
         inheritance.split(",").map { it.trim() }.forEach { parent ->
             val parentName = parent.replace(Regex("""\([^)]*\)"""), "").trim()
             if (parentName.isNotEmpty()) {
-                // We'll create placeholder nodes for parents
-                // Full resolution requires semantic analysis
+                // Get or create external type node ID
+                val parentNodeId = externalTypes.getOrPut(parentName) { nextId() }
+                
                 relationships.add(GraphRelationship(
                     id = nextId(),
                     type = if (parent.contains("(")) RelTypes.EXTENDS else RelTypes.IMPLEMENTS,
                     startNodeId = typeNode.id,
-                    endNodeId = "unresolved:$parentName",
+                    endNodeId = parentNodeId,
                     properties = mapOf("parentName" to parentName)
                 ))
             }
