@@ -14,9 +14,25 @@ repositories {
     maven("https://redirector.kotlinlang.org/maven/kotlin-ide-plugin-dependencies")
     
     maven("https://packages.jetbrains.team/maven/p/ij/intellij-dependencies")
+    maven("https://www.jetbrains.com/intellij-repository/releases")
 }
 
 dependencies {
+    val intellijPlatformVersion = "253.29346.379"
+    listOf(
+        "com.jetbrains.intellij.platform:util-rt",
+        "com.jetbrains.intellij.platform:util-class-loader",
+        "com.jetbrains.intellij.platform:util-text-matching",
+        "com.jetbrains.intellij.platform:util",
+        "com.jetbrains.intellij.platform:util-base",
+        "com.jetbrains.intellij.platform:util-coroutines",
+        "com.jetbrains.intellij.platform:util-xml-dom",
+        "com.jetbrains.intellij.platform:core",
+        "com.jetbrains.intellij.platform:core-impl",
+    ).forEach {
+        implementation("$it:$intellijPlatformVersion") { isTransitive = false }
+    }
+
     val analysisVersion = "2.1.21"
     listOf(
         "org.jetbrains.kotlin:analysis-api-k2-for-ide",
