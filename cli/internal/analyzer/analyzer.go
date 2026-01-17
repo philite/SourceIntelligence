@@ -25,40 +25,69 @@ func NewAnalyzer(analyzerDir string) *Analyzer {
 }
 
 // AnalyzeProject runs the Kotlin analyzer on a project and returns the graph
-func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semantic bool) (*memgraph.CodeGraph, error) {
+func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semantic bool, fullK2 bool) (*memgraph.CodeGraph, error) {
 	// Convert to absolute path
 	absProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve project path: %w", err)
 	}
 
-	// Build Gradle run command
-	gradlew := "gradlew"
+	var args []string
+	var cmdPath string
+
+	// Check if distribution script exists
+	distScript := filepath.Join(a.analyzerDir, "build", "install", "analyzer", "bin", "analyzer")
 	if os.PathSeparator == '\\' {
-		gradlew = "gradlew.bat"
+		distScript += ".bat"
 	}
 
-	// Build the analyzer arguments: analyze <path> [-m module] [--semantic]
-	analyzerArgs := "analyze " + absProjectPath
-	if moduleName != "" {
-		analyzerArgs += " -m " + moduleName
-	}
-	if semantic {
-		analyzerArgs += " --semantic"
+	if _, err := os.Stat(distScript); err == nil {
+		// Use distribution script (faster)
+		cmdPath = distScript
+		args = []string{"analyze", absProjectPath}
+		if moduleName != "" {
+			args = append(args, "--module", moduleName)
+		}
+		if semantic {
+			args = append(args, "--semantic")
+		}
+		if fullK2 {
+			args = append(args, "--full-k2")
+		}
+	} else {
+		// Fallback to Gradle (slower)
+		gradlew := "gradlew"
+		if os.PathSeparator == '\\' {
+			gradlew = "gradlew.bat"
+		}
+		cmdPath = filepath.Join(a.analyzerDir, gradlew)
+		
+		// Build Gradle run args
+		gradleArgs := "analyze " + absProjectPath
+		if moduleName != "" {
+			gradleArgs += " -m " + moduleName
+		}
+		if semantic {
+			gradleArgs += " --semantic"
+		}
+		if fullK2 {
+			gradleArgs += " --full-k2"
+		}
+		args = []string{"run", "--quiet", "--args=" + gradleArgs}
 	}
 
-	args := []string{"run", "--quiet", "--args=" + analyzerArgs}
-
-	cmd := exec.Command(filepath.Join(a.analyzerDir, gradlew), args...)
-	cmd.Dir = a.analyzerDir
+	cmd := exec.Command(cmdPath, args...)
+	// Only set Dir if using Gradle, otherwise dist script handles it relative to itself or CWD
+	if cmdPath != distScript {
+		cmd.Dir = a.analyzerDir
+	}
 	
 	var stdout bytes.Buffer
-	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = os.Stderr // Stream stderr directly to console
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("analyzer failed: %w\nstderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("analyzer failed: %w", err)
 	}
 
 	// Parse the JSON output
