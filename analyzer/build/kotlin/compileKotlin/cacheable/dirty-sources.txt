@@ -1,0 +1,4 @@
+C:\Users\Phil\Documents\Playground\SourceIntelligence\analyzer\src\main\kotlin\com\sourceintel\analyzer\Main.kt
+C:\Users\Phil\Documents\Playground\SourceIntelligence\analyzer\src\main\kotlin\com\sourceintel\analyzer\k2\K2Analyzer.kt
+C:\Users\Phil\Documents\Playground\SourceIntelligence\analyzer\src\main\kotlin\com\sourceintel\analyzer\graph\GraphModel.kt
+C:\Users\Phil\Documents\Playground\SourceIntelligence\analyzer\src\main\kotlin\com\sourceintel\analyzer\output\GraphJsonWriter.kt
