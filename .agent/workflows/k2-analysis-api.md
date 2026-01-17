@@ -105,7 +105,7 @@ Would require:
 3. Or waiting for better standalone support from JetBrains
 
 ## Resources
-- Source code: https://github.com/JetBrains/kotlin/tree/master/analysis
+- Source code: https://github.com/JetBrains/kotlin/tree/v2.1.21/analysis
 - Key files:
   - `StandaloneAnalysisAPISessionBuilder.kt`
   - `StandaloneProjectFactory.kt`

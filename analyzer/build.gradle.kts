@@ -18,7 +18,7 @@ repositories {
 }
 
 dependencies {
-    val intellijPlatformVersion = "253.29346.379"
+    val intellijPlatformVersion = "251.29188.11"
     listOf(
         "com.jetbrains.intellij.platform:util-rt",
         "com.jetbrains.intellij.platform:util-class-loader",
@@ -29,11 +29,22 @@ dependencies {
         "com.jetbrains.intellij.platform:util-xml-dom",
         "com.jetbrains.intellij.platform:core",
         "com.jetbrains.intellij.platform:core-impl",
+        "com.jetbrains.intellij.platform:extensions",
+        "com.jetbrains.intellij.platform:diagnostic",
+        "com.jetbrains.intellij.platform:diagnostic-telemetry",
     ).forEach {
         implementation("$it:$intellijPlatformVersion") { isTransitive = false }
     }
 
     val analysisVersion = "2.1.21"
+
+    // 2. CRITICAL CHANGE: Use the aggregate Compiler JAR
+    // This replaces 'embeddable' and the granular 'common/fir/fe10/ir' jars.
+    // We set transitive=false to prevent it from downgrading your platform jars.
+    implementation("org.jetbrains.kotlin:kotlin-compiler:$analysisVersion") { 
+        isTransitive = false 
+    }
+
     listOf(
         "org.jetbrains.kotlin:analysis-api-k2-for-ide",
         "org.jetbrains.kotlin:analysis-api-for-ide",
@@ -42,14 +53,14 @@ dependencies {
         "org.jetbrains.kotlin:symbol-light-classes-for-ide",
         "org.jetbrains.kotlin:analysis-api-standalone-for-ide",
         "org.jetbrains.kotlin:analysis-api-impl-base-for-ide",
-        "org.jetbrains.kotlin:kotlin-compiler-common-for-ide",
-        "org.jetbrains.kotlin:kotlin-compiler-fir-for-ide",
-        "org.jetbrains.kotlin:kotlin-compiler-fe10-for-ide",
-        "org.jetbrains.kotlin:kotlin-compiler-ir-for-ide",
+        //"org.jetbrains.kotlin:kotlin-compiler-common-for-ide",
+        //"org.jetbrains.kotlin:kotlin-compiler-fir-for-ide",
+        //"org.jetbrains.kotlin:kotlin-compiler-fe10-for-ide",
+        //"org.jetbrains.kotlin:kotlin-compiler-ir-for-ide",
     ).forEach {
         implementation("$it:$analysisVersion") { isTransitive = false }
     }
-    
+
     // Android Lint API - Updated to latest stable 2026 version
     implementation("com.android.tools.lint:lint-api:31.13.2")
     implementation("com.android.tools:sdk-common:31.13.2")
