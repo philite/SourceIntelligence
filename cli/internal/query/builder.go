@@ -29,7 +29,7 @@ func (b *Builder) FindSymbol(ctx context.Context, name string, symbolType string
 		query = "MATCH (n) WHERE n.name CONTAINS $name OR n.fqn CONTAINS $name RETURN n"
 	}
 	
-	return b.client.Query(ctx, query)
+	return b.client.QueryWithParams(ctx, query, map[string]any{"name": name})
 }
 
 // GetReferences finds all usages of a symbol

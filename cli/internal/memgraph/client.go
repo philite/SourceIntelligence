@@ -60,7 +60,11 @@ func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte) error {
 	defer session.Close(ctx)
 
 	// Create nodes
-	for _, node := range graph.Nodes {
+	for _, nodeRaw := range graph.Nodes {
+		var node GenericNode
+		if err := json.Unmarshal(nodeRaw, &node); err != nil {
+			return fmt.Errorf("failed to parse node: %w", err)
+		}
 		if err := c.createNode(ctx, session, node); err != nil {
 			return fmt.Errorf("failed to create node %s: %w", node.ID, err)
 		}
@@ -76,7 +80,7 @@ func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte) error {
 	return nil
 }
 
-func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContext, node GraphNode) error {
+func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContext, node GenericNode) error {
 	// Build labels string
 	labels := ""
 	for i, label := range node.Labels {
@@ -86,12 +90,8 @@ func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContex
 		labels += label
 	}
 
-	// Build properties
-	props := make(map[string]any)
-	props["id"] = node.ID
-	for k, v := range node.Properties {
-		props[k] = v
-	}
+	// Get merged properties (includes name, fqn, etc.)
+	props := node.ToProperties()
 
 	query := fmt.Sprintf("CREATE (n:%s $props)", labels)
 	_, err := session.Run(ctx, query, map[string]any{"props": props})
@@ -119,10 +119,15 @@ func (c *Client) createRelationship(ctx context.Context, session neo4j.SessionWi
 
 // Query executes a Cypher query and returns results as JSON
 func (c *Client) Query(ctx context.Context, cypher string) ([]map[string]any, error) {
+	return c.QueryWithParams(ctx, cypher, nil)
+}
+
+// QueryWithParams executes a Cypher query with parameters
+func (c *Client) QueryWithParams(ctx context.Context, cypher string, params map[string]any) ([]map[string]any, error) {
 	session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
 	defer session.Close(ctx)
 
-	result, err := session.Run(ctx, cypher, nil)
+	result, err := session.Run(ctx, cypher, params)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
