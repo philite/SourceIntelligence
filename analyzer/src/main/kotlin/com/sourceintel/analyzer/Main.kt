@@ -4,9 +4,11 @@ import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.core.main
 import com.github.ajalt.clikt.core.subcommands
 import com.github.ajalt.clikt.parameters.arguments.argument
+import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.types.path
 import com.sourceintel.analyzer.k2.K2Analyzer
+import com.sourceintel.analyzer.k2.K2SemanticAnalyzer
 import com.sourceintel.analyzer.output.GraphJsonWriter
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlin.io.path.exists
@@ -26,16 +28,24 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
     
     private val moduleName by option("-m", "--module")
     
+    private val semantic by option("-s", "--semantic", help = "Use K2 semantic analysis (slower but more accurate)")
+        .flag(default = false)
+    
     override fun run() {
-        logger.info { "Analyzing project: $projectPath" }
+        logger.info { "Analyzing project: $projectPath (semantic=$semantic)" }
         
         if (!projectPath.exists()) {
             logger.error { "Project path does not exist: $projectPath" }
             return
         }
         
-        val analyzer = K2Analyzer(projectPath)
-        val graph = analyzer.analyze(moduleName)
+        val graph = if (semantic) {
+            logger.info { "Using K2 FIR semantic analysis" }
+            K2SemanticAnalyzer(projectPath).analyze(moduleName)
+        } else {
+            logger.info { "Using regex-based analysis" }
+            K2Analyzer(projectPath).analyze(moduleName)
+        }
         
         val writer = GraphJsonWriter()
         val json = writer.toJson(graph)

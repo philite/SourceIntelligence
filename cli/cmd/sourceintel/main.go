@@ -36,6 +36,7 @@ var indexCmd = &cobra.Command{
 		projectPath := args[0]
 		moduleName, _ := cmd.Flags().GetString("module")
 		analyzerDir, _ := cmd.Flags().GetString("analyzer-dir")
+		semantic, _ := cmd.Flags().GetBool("semantic")
 		
 		fmt.Printf("Indexing project: %s\n", projectPath)
 		
@@ -43,8 +44,12 @@ var indexCmd = &cobra.Command{
 		a := analyzer.NewAnalyzer(analyzerDir)
 		
 		// Analyze project
-		fmt.Println("Running Kotlin analyzer...")
-		graph, err := a.AnalyzeProject(projectPath, moduleName)
+		if semantic {
+			fmt.Println("Running PSI-enhanced analyzer...")
+		} else {
+			fmt.Println("Running Kotlin analyzer...")
+		}
+		graph, err := a.AnalyzeProject(projectPath, moduleName, semantic)
 		if err != nil {
 			return fmt.Errorf("analysis failed: %w", err)
 		}
@@ -168,6 +173,7 @@ func init() {
 	// Index command flags
 	indexCmd.Flags().String("module", "", "Specific module to analyze")
 	indexCmd.Flags().String("analyzer-dir", "../analyzer", "Path to analyzer directory (containing gradlew)")
+	indexCmd.Flags().Bool("semantic", false, "Use PSI-enhanced semantic analysis (slower but more accurate)")
 	
 	// Find command flags
 	findCmd.Flags().String("type", "", "Filter by symbol type (e.g., ViewModel, UseCase)")

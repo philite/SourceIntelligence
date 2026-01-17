@@ -25,7 +25,7 @@ func NewAnalyzer(analyzerDir string) *Analyzer {
 }
 
 // AnalyzeProject runs the Kotlin analyzer on a project and returns the graph
-func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string) (*memgraph.CodeGraph, error) {
+func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semantic bool) (*memgraph.CodeGraph, error) {
 	// Convert to absolute path
 	absProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
@@ -38,10 +38,13 @@ func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string) (*memgr
 		gradlew = "gradlew.bat"
 	}
 
-	// Build the analyzer arguments: analyze <path> [-m module]
+	// Build the analyzer arguments: analyze <path> [-m module] [--semantic]
 	analyzerArgs := "analyze " + absProjectPath
 	if moduleName != "" {
-		analyzerArgs = "analyze " + absProjectPath + " -m " + moduleName
+		analyzerArgs += " -m " + moduleName
+	}
+	if semantic {
+		analyzerArgs += " --semantic"
 	}
 
 	args := []string{"run", "--quiet", "--args=" + analyzerArgs}
