@@ -12,6 +12,8 @@ import com.sourceintel.analyzer.k2.ClasspathConfig
 import com.sourceintel.analyzer.k2.K2Analyzer
 import com.sourceintel.analyzer.k2.K2FullAnalyzer
 import com.sourceintel.analyzer.k2.K2SemanticAnalyzer
+import com.sourceintel.analyzer.android.AndroidEnricher
+import com.sourceintel.analyzer.graph.CodeGraph
 import com.sourceintel.analyzer.output.GraphJsonWriter
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlin.io.path.exists
@@ -37,6 +39,9 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
     private val fullK2 by option("--full-k2", help = "Use full K2 FIR analysis with resolved types (slower but most accurate)")
         .flag(default = false)
     
+    private val android by option("--android", help = "Enable Android enrichment (parse layouts, navigation, manifests)")
+        .flag(default = false)
+    
     private val excludeGradleCache by option("--exclude-gradle-cache", help = "Skip Gradle cache JARs (~/.gradle/caches)")
         .flag(default = false)
     
@@ -50,14 +55,14 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
         .multiple()
     
     override fun run() {
-        logger.info { "Analyzing project: $projectPath (fullK2=$fullK2, semantic=$semantic)" }
+        logger.info { "Analyzing project: $projectPath (fullK2=$fullK2, semantic=$semantic, android=$android)" }
         
         if (!projectPath.exists()) {
             logger.error { "Project path does not exist: $projectPath" }
             return
         }
         
-        val graph = when {
+        var graph = when {
             fullK2 -> {
                 logger.info { "Using full K2 FIR analysis with resolved types" }
                 val config = ClasspathConfig.fromFlags(
@@ -76,6 +81,25 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
             else -> {
                 logger.info { "Using regex-based analysis" }
                 K2Analyzer(projectPath).analyze(moduleName)
+            }
+        }
+        
+        // Android enrichment
+        if (android) {
+            val enricher = AndroidEnricher(projectPath)
+            if (enricher.isAndroidProject()) {
+                logger.info { "Running Android enrichment..." }
+                val (androidNodes, androidRels) = enricher.enrich(graph.nodes)
+                
+                // Merge Android data into graph
+                graph = CodeGraph(
+                    meta = graph.meta.copy(projectType = "android"),
+                    nodes = graph.nodes + androidNodes,
+                    relationships = graph.relationships + androidRels
+                )
+                logger.info { "Android enrichment added ${androidNodes.size} nodes and ${androidRels.size} relationships" }
+            } else {
+                logger.warn { "Android flag set but project doesn't appear to be an Android project" }
             }
         }
         

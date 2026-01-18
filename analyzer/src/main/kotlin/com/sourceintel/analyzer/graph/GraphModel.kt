@@ -102,6 +102,39 @@ enum class TypeKind {
     CLASS, INTERFACE, OBJECT, ENUM, ANNOTATION, TYPE_ALIAS, STRUCT
 }
 
+// Android UI Nodes
+@Serializable
+data class LayoutNode(
+    override val id: String,
+    override val labels: List<String> = listOf("Layout"),
+    override val properties: Map<String, String> = emptyMap(),
+    val name: String,
+    val file: String
+) : GraphNode()
+
+@Serializable
+data class ViewNode(
+    override val id: String,
+    override val labels: List<String> = listOf("View"),
+    override val properties: Map<String, String> = emptyMap(),
+    val viewId: String,          // e.g., "btn_login"
+    val viewType: String,        // e.g., "Button", "TextView"
+    val text: String? = null,    // android:text if present
+    val file: String,
+    val line: Int
+) : GraphNode()
+
+@Serializable
+data class NavDestinationNode(
+    override val id: String,
+    override val labels: List<String> = listOf("NavDestination"),
+    override val properties: Map<String, String> = emptyMap(),
+    val navId: String,           // e.g., "homeFragment"
+    val label: String?,          // android:label
+    val className: String,       // class FQN
+    val navGraphFile: String
+) : GraphNode()
+
 @Serializable
 data class GraphRelationship(
     val id: String,
@@ -131,4 +164,10 @@ object RelTypes {
     const val CALLS_API = "CALLS_API"
     const val PROVIDES = "PROVIDES"
     const val BINDS = "BINDS"
+    
+    // Android UI
+    const val USES_LAYOUT = "USES_LAYOUT"
+    const val CHILD_OF = "CHILD_OF"
+    const val NAVIGATES_TO = "NAVIGATES_TO"
+    const val IMPLEMENTED_BY = "IMPLEMENTED_BY"
 }
