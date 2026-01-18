@@ -48,15 +48,39 @@ class ClasspathResolver(private val config: ClasspathConfig = ClasspathConfig.DE
     
     /**
      * Resolves all dependency JARs for the given project.
-     * Parses build.gradle.kts to find declared dependencies, then locates JARs.
+     * Recursively scans for build.gradle and build.gradle.kts files.
      */
     fun resolveClasspath(projectPath: Path): List<Path> {
-        val dependencies = parseBuildGradle(projectPath)
-        logger.info { "Found ${dependencies.size} declared dependencies" }
+        val buildFiles = projectPath.walk()
+            .filter { it.name == "build.gradle" || it.name == "build.gradle.kts" }
+            .filter { path ->
+                // Ensure we don't pick up files inside build/ or .gradle/ directories
+                // Check all parent segments
+                path.parent?.any { it.toString() == "build" || it.toString() == ".gradle" } != true
+            }
+            .toList()
+            
+        logger.info { "Found ${buildFiles.size} build files" }
+        
+        val allDependencies = mutableListOf<Dependency>()
+        
+        // First pass: Collect root variables (often defined in root build.gradle)
+        val globalVars = mutableMapOf<String, String>()
+        val rootBuildFile = buildFiles.find { it.parent == projectPath }
+        if (rootBuildFile != null) {
+            extractVariables(rootBuildFile, globalVars)
+        }
+        
+        for (buildFile in buildFiles) {
+             val deps = parseBuildGradle(buildFile, globalVars)
+             allDependencies.addAll(deps)
+        }
+        
+        logger.info { "Found ${allDependencies.size} total declared dependencies" }
         
         val resolvedJars = mutableListOf<Path>()
         
-        for (dep in dependencies) {
+        for (dep in allDependencies) {
             val jar = findJar(dep, projectPath)
             if (jar != null) {
                 if (!isExcluded(jar)) {
@@ -69,10 +93,10 @@ class ClasspathResolver(private val config: ClasspathConfig = ClasspathConfig.DE
             }
         }
         
-        logger.info { "Resolved ${resolvedJars.size} JARs from ${dependencies.size} dependencies" }
+        logger.info { "Resolved ${resolvedJars.size} JARs from ${allDependencies.size} dependencies" }
         return resolvedJars
     }
-    
+
     /**
      * Gets Kotlin stdlib and runtime JARs needed for basic analysis.
      */
@@ -102,74 +126,74 @@ class ClasspathResolver(private val config: ClasspathConfig = ClasspathConfig.DE
             .replace("?", ".")
         return name.matches(Regex(regex, RegexOption.IGNORE_CASE))
     }
-    
-    /**
-     * Parses build.gradle.kts to extract dependencies.
-     */
-    private fun parseBuildGradle(projectPath: Path): List<Dependency> {
-        val buildFile = projectPath.resolve("build.gradle.kts")
-        if (!buildFile.exists()) {
-            logger.warn { "No build.gradle.kts found at $projectPath" }
-            return emptyList()
-        }
+
+    private fun extractVariables(buildFile: Path, varMap: MutableMap<String, String>) {
+        val content = buildFile.readText()
         
+        // Groovy: ext.var = 'val' or def var = 'val' or var = 'val'
+        // Kotlin: val var = "val" or extra["var"] = "val"
+        
+        val patterns = listOf(
+            Regex("""ext\.(\w+)\s*=\s*['"]([^'"]+)['"]"""),
+            Regex("""def\s+(\w+)\s*=\s*['"]([^'"]+)['"]"""),
+            Regex("""val\s+(\w+)\s*=\s*['"]([^'"]+)['"]"""),
+            Regex("""extra\["(\w+)"\]\s*=\s*['"]([^'"]+)['"]""")
+        )
+        
+        patterns.forEach { regex ->
+            regex.findAll(content).forEach { match ->
+                varMap[match.groupValues[1]] = match.groupValues[2]
+            }
+        }
+    }
+
+    /**
+     * Parses build.gradle.kts or build.gradle to extract dependencies.
+     */
+    private fun parseBuildGradle(buildFile: Path, globalVars: Map<String, String>): List<Dependency> {
         val content = buildFile.readText()
         val dependencies = mutableListOf<Dependency>()
         
-        // Match implementation("group:artifact:version") - full literal coordinates
-        val simpleDepRegex = Regex("""implementation\s*\(\s*"([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)"\s*\)""")
-        simpleDepRegex.findAll(content).forEach { match ->
-            val dep = Dependency(
-                group = match.groupValues[1],
-                artifact = match.groupValues[2],
-                version = match.groupValues[3]
-            )
-            if (dep.isValid()) {
-                dependencies.add(dep)
+        // Local variables for this file
+        val localVars = globalVars.toMutableMap()
+        extractVariables(buildFile, localVars)
+        
+        // Resolver helper
+        fun resolveVersion(v: String): String {
+            if (v.startsWith("$") || v.startsWith("\$")) {
+                val varName = v.trimStart('$', '{').trimEnd('}')
+                return localVars[varName] ?: v
             }
+            return v
         }
-        
-        // Match runtimeOnly/api/compileOnly("group:artifact:version")
-        val otherConfigRegex = Regex("""(?:runtimeOnly|api|compileOnly)\s*\(\s*"([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)"\s*\)""")
-        otherConfigRegex.findAll(content).forEach { match ->
-            val dep = Dependency(
-                group = match.groupValues[1],
-                artifact = match.groupValues[2],
-                version = match.groupValues[3]
-            )
-            if (dep.isValid()) {
-                dependencies.add(dep)
-            }
-        }
-        
-        // Look for version variable definitions like: val analysisVersion = "2.1.21"
-        val versionVars = mutableMapOf<String, String>()
-        val versionVarRegex = Regex("""val\s+(\w+)\s*=\s*"([^"]+)"""")
-        versionVarRegex.findAll(content).forEach { match ->
-            versionVars[match.groupValues[1]] = match.groupValues[2]
-        }
-        
-        // Match listOf patterns - look for patterns with $variable interpolation
-        // e.g., listOf("group:artifact", ...).forEach { implementation("$it:$version") }
-        val listOfBlockRegex = Regex("""listOf\s*\(([^)]+)\)\s*\.forEach\s*\{[^}]*\$(\w+)""")
-        listOfBlockRegex.findAll(content).forEach { listMatch ->
-            val listContent = listMatch.groupValues[1]
-            val versionVarName = listMatch.groupValues[2]
-            val version = versionVars[versionVarName]
+
+        // 1. Match standard implementation("group:artifact:version") - KTS & Groovy
+        // regex matches: implementation "group:artifact:version" (with opt parens and quotes)
+        val stdDepRegex = Regex("""(?:implementation|api|compile|runtimeOnly)\s*\(?\s*["']([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([^'"]+)["']\s*\)?""")
+        stdDepRegex.findAll(content).forEach { match ->
+            val versionRaw = match.groupValues[3]
+            val version = resolveVersion(versionRaw)
             
-            if (version != null) {
-                // Extract items: "group:artifact" or "com.example:artifact"
-                val itemRegex = Regex(""""([a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+)"""")
-                itemRegex.findAll(listContent).forEach { itemMatch ->
-                    val parts = itemMatch.groupValues[1].split(":")
-                    if (parts.size == 2) {
-                        val dep = Dependency(parts[0], parts[1], version)
-                        if (dep.isValid()) {
-                            dependencies.add(dep)
-                        }
-                    }
-                }
-            }
+            val dep = Dependency(
+                group = match.groupValues[1],
+                artifact = match.groupValues[2],
+                version = version
+            )
+            if (dep.isValid()) dependencies.add(dep)
+        }
+        
+        // 2. Groovy map style: implementation group: '...', name: '...', version: '...'
+        val mapDepRegex = Regex("""(?:implementation|api|compile)\s+group:\s*['"]([^'"]+)['"]\s*,\s*name:\s*['"]([^'"]+)['"]\s*,\s*version:\s*['"]([^'"]+)['"]""")
+        mapDepRegex.findAll(content).forEach { match ->
+            val versionRaw = match.groupValues[3]
+            val version = resolveVersion(versionRaw)
+
+            val dep = Dependency(
+                group = match.groupValues[1],
+                artifact = match.groupValues[2],
+                version = version
+            )
+            if (dep.isValid()) dependencies.add(dep)
         }
         
         return dependencies.distinctBy { "${it.group}:${it.artifact}" }
