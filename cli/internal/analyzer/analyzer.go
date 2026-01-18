@@ -19,13 +19,17 @@ type Analyzer struct {
 // NewAnalyzer creates a new analyzer wrapper
 // analyzerDir should be the path to the analyzer directory (containing gradlew)
 func NewAnalyzer(analyzerDir string) *Analyzer {
+	// Always use absolute path to avoid issues with child process working directory
+	if absDir, err := filepath.Abs(analyzerDir); err == nil {
+		analyzerDir = absDir
+	}
 	return &Analyzer{
 		analyzerDir: analyzerDir,
 	}
 }
 
 // AnalyzeProject runs the Kotlin analyzer on a project and returns the graph
-func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semantic bool, fullK2 bool) (*memgraph.CodeGraph, error) {
+func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semantic bool, fullK2 bool, android bool) (*memgraph.CodeGraph, error) {
 	// Convert to absolute path
 	absProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
@@ -54,6 +58,9 @@ func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semanti
 		if fullK2 {
 			args = append(args, "--full-k2")
 		}
+		if android {
+			args = append(args, "--android")
+		}
 	} else {
 		// Fallback to Gradle (slower)
 		gradlew := "gradlew"
@@ -72,6 +79,9 @@ func (a *Analyzer) AnalyzeProject(projectPath string, moduleName string, semanti
 		}
 		if fullK2 {
 			gradleArgs += " --full-k2"
+		}
+		if android {
+			gradleArgs += " --android"
 		}
 		args = []string{"run", "--quiet", "--args=" + gradleArgs}
 	}

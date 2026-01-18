@@ -39,11 +39,20 @@ var indexCmd = &cobra.Command{
 		analyzerDir, _ := cmd.Flags().GetString("analyzer-dir")
 		semantic, _ := cmd.Flags().GetBool("semantic")
 		fullK2, _ := cmd.Flags().GetBool("full-k2")
+		android, _ := cmd.Flags().GetBool("android")
 		clearFirst, _ := cmd.Flags().GetBool("clear")
 		useMerge, _ := cmd.Flags().GetBool("merge")
 		
 		fmt.Printf("Indexing project: %s\n", projectPath)
 		
+
+		// Auto-detect analyzer directory if not explicitly correctly set or using default
+		if analyzerDir == "../analyzer" {
+			if foundDir, err := analyzer.FindAnalyzerDir(); err == nil {
+				analyzerDir = foundDir
+			}
+		}
+
 		// Create analyzer
 		a := analyzer.NewAnalyzer(analyzerDir)
 		
@@ -55,7 +64,7 @@ var indexCmd = &cobra.Command{
 		} else {
 			fmt.Println("Running Kotlin analyzer...")
 		}
-		graph, err := a.AnalyzeProject(projectPath, moduleName, semantic, fullK2)
+		graph, err := a.AnalyzeProject(projectPath, moduleName, semantic, fullK2, android)
 		if err != nil {
 			return fmt.Errorf("analysis failed: %w", err)
 		}
@@ -286,6 +295,7 @@ func init() {
 	indexCmd.Flags().String("analyzer-dir", "../analyzer", "Path to analyzer directory (containing gradlew)")
 	indexCmd.Flags().Bool("semantic", false, "Use PSI-enhanced semantic analysis (slower but more accurate)")
 	indexCmd.Flags().Bool("full-k2", false, "Use full K2 semantic analysis with classpath (slowest but most accurate)")
+	indexCmd.Flags().Bool("android", false, "Run Android enrichment (layouts, manifest, navigation, Compose)")
 	indexCmd.Flags().Bool("clear", false, "Clear existing graph before indexing (prevents duplicates)")
 	indexCmd.Flags().Bool("merge", false, "Use MERGE instead of CREATE for incremental updates")
 	
