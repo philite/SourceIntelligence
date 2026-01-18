@@ -12,6 +12,7 @@ import com.sourceintel.analyzer.k2.ClasspathConfig
 import com.sourceintel.analyzer.k2.K2Analyzer
 import com.sourceintel.analyzer.k2.K2FullAnalyzer
 import com.sourceintel.analyzer.k2.K2SemanticAnalyzer
+import com.sourceintel.analyzer.k2.KotlinVersionDetector
 import com.sourceintel.analyzer.android.AndroidEnricher
 import com.sourceintel.analyzer.graph.CodeGraph
 import com.sourceintel.analyzer.output.GraphJsonWriter
@@ -64,7 +65,6 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
         
         var graph = when {
             fullK2 -> {
-                logger.info { "Using full K2 FIR analysis with resolved types" }
                 val config = ClasspathConfig.fromFlags(
                     excludeGradleCache = excludeGradleCache,
                     excludeMavenLocal = excludeMavenLocal,
@@ -72,7 +72,17 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
                     excludeLibPatterns = excludeLib
                 )
                 logger.info { "Classpath config: gradle=${!excludeGradleCache}, maven=${!excludeMavenLocal}, build=${!excludeBuildDir}, excludes=${excludeLib}" }
-                K2FullAnalyzer(projectPath, config).analyze(moduleName)
+                
+                // Detect Kotlin version to choose appropriate analyzer
+                val kotlinVersion = KotlinVersionDetector.detectVersion(projectPath)
+                
+                if (kotlinVersion == null || kotlinVersion.isK2Compatible()) {
+                    logger.info { "Using full K2 FIR analysis (Kotlin ${kotlinVersion ?: "unknown, assuming 2.0+"})" }
+                    K2FullAnalyzer(projectPath, config).analyze(moduleName)
+                } else {
+                    logger.info { "Project uses Kotlin $kotlinVersion (< 2.0) - using PSI semantic analysis instead of K2 FIR" }
+                    K2SemanticAnalyzer(projectPath).analyze(moduleName)
+                }
             }
             semantic -> {
                 logger.info { "Using PSI semantic analysis" }

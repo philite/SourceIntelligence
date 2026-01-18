@@ -14,6 +14,9 @@ import org.jetbrains.kotlin.platform.jvm.JvmPlatforms
 import org.jetbrains.kotlin.psi.*
 import java.nio.file.Path
 import java.time.Instant
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.io.path.*
 
 private val logger = KotlinLogging.logger {}
@@ -99,9 +102,22 @@ class K2FullAnalyzer(
             
             logger.info { "Analyzing ${ktFiles.size} KtFiles from session" }
             
+            var processedCount = 0
+            val totalFiles = ktFiles.size
+            val startTime = System.currentTimeMillis()
+
             for (ktFile in ktFiles) {
+                processedCount++
+                if (processedCount % 10 == 0 || processedCount == totalFiles) {
+                    val percent = (processedCount * 100) / totalFiles
+                    logger.info { "Analyzing $processedCount/$totalFiles ($percent%) - ${ktFile.name}" }
+                }
+                
+                // Synchronous analysis - no async timeout to avoid zombie threads holding K2 locks
                 try {
-                    analyzeFileWithK2(ktFile, nodes, relationships)
+                    val (fileNodes, fileRels) = analyzeFileWithK2(ktFile)
+                    nodes.addAll(fileNodes)
+                    relationships.addAll(fileRels)
                 } catch (e: Exception) {
                     logger.warn { "Failed to analyze ${ktFile.name}: ${e.message}" }
                 }
@@ -135,10 +151,11 @@ class K2FullAnalyzer(
     }
     
     private fun analyzeFileWithK2(
-        ktFile: KtFile,
-        nodes: MutableList<GraphNode>,
-        relationships: MutableList<GraphRelationship>
-    ) {
+        ktFile: KtFile
+    ): Pair<List<GraphNode>, List<GraphRelationship>> {
+        val nodes = mutableListOf<GraphNode>()
+        val relationships = mutableListOf<GraphRelationship>()
+
         val packageName = ktFile.packageFqName.asString()
         val relativePath = try {
             projectPath.relativize(Path.of(ktFile.virtualFilePath)).toString()
@@ -185,6 +202,8 @@ class K2FullAnalyzer(
                 analyzeDeclarationWithK2(declaration, fileNode, packageName, nodes, relationships)
             }
         }
+        
+        return nodes to relationships
     }
     
     private fun org.jetbrains.kotlin.analysis.api.KaSession.analyzeDeclarationWithK2(
@@ -210,9 +229,14 @@ class K2FullAnalyzer(
     ) {
         val name = ktClass.name ?: return
         
-        // Get class symbol for semantic information
-        val classSymbol = ktClass.symbol as? KaClassSymbol ?: return
-        
+        // Get class symbol for semantic information (with safe error handling)
+        val classSymbol = try {
+            ktClass.symbol as? KaClassSymbol
+        } catch (e: Exception) {
+            logger.debug { "Symbol resolution failed for $name: ${e.message}" }
+            null
+        } ?: return
+         
         // Get FQN from symbol (resolves to actual package)
         val fqn = classSymbol.classId?.asFqNameString() ?: "$packageName.$name"
         
@@ -278,10 +302,15 @@ class K2FullAnalyzer(
             endNodeId = typeNode.id
         ))
         
-        // Extract inheritance with full FQN resolution
+        // Extract inheritance with full FQN resolution (with safe error handling)
         for (superTypeEntry in ktClass.superTypeListEntries) {
             val superTypeRef = superTypeEntry.typeReference ?: continue
-            val superType = superTypeRef.type
+            val superType = try {
+                superTypeRef.type
+            } catch (e: Exception) {
+                logger.debug { "Type resolution failed for supertype: ${e.message}" }
+                continue
+            }
             
             val parentFqn = resolveTypeFqn(superType)
             if (parentFqn.isNotEmpty() && parentFqn != "kotlin.Any") {
@@ -311,14 +340,20 @@ class K2FullAnalyzer(
         }
         
         // Constructor parameters as properties
-        ktClass.primaryConstructorParameters.forEach { param ->
+        if (ktClass !is KtObjectDeclaration) {
+            ktClass.primaryConstructorParameters.forEach { param ->
             if (param.hasValOrVar()) {
                 val propName = param.name ?: return@forEach
                 val propFqn = "$fqn.$propName"
                 
-                // Get type from K2
-                val paramSymbol = param.symbol
-                val typeFqn = resolveTypeFqn(paramSymbol.returnType)
+                // Get type from K2 (with safe error handling)
+                val typeFqn = try {
+                    val paramSymbol = param.symbol
+                    resolveTypeFqn(paramSymbol.returnType)
+                } catch (e: Exception) {
+                    logger.debug { "Parameter type resolution failed for $propName: ${e.message}" }
+                    param.typeReference?.text ?: "Unknown"
+                }
                 
                 val fieldNode = FieldNode(
                     id = nextId(),
@@ -347,6 +382,7 @@ class K2FullAnalyzer(
                 addTypeRelationship(fieldNode.id, typeFqn, relationships)
             }
         }
+        } // End if !is KtObjectDeclaration
     }
     
     private fun org.jetbrains.kotlin.analysis.api.KaSession.analyzeFunctionWithK2(
@@ -360,18 +396,31 @@ class K2FullAnalyzer(
         val name = function.name ?: return
         val fqn = "$containerFqn.$name"
         
-        // Get function symbol for resolved types
-        val functionSymbol = function.symbol
+        // Get function symbol for resolved types (with safe error handling)
+        val functionSymbol = try {
+            function.symbol
+        } catch (e: Exception) {
+            logger.debug { "Function symbol resolution failed for $name: ${e.message}" }
+            null
+        }
         
-        // Build parameter list with resolved types
+        // Build parameter list with resolved types (fall back to PSI text)
         val params = function.valueParameters.map { param ->
             val paramName = param.name ?: "_"
-            val paramSymbol = param.symbol
-            val paramType = resolveTypeFqn(paramSymbol.returnType)
+            val paramType = try {
+                val paramSymbol = param.symbol
+                resolveTypeFqn(paramSymbol.returnType)
+            } catch (e: Exception) {
+                param.typeReference?.text ?: "Unknown"
+            }
             "$paramName: $paramType"
         }
         
-        val returnType = resolveTypeFqn(functionSymbol.returnType)
+        val returnType = try {
+            functionSymbol?.let { resolveTypeFqn(it.returnType) } ?: function.typeReference?.text ?: "Unit"
+        } catch (e: Exception) {
+            function.typeReference?.text ?: "Unit"
+        }
         val signature = "(${params.joinToString(", ")}): $returnType"
         
         val isSuspend = function.hasModifier(org.jetbrains.kotlin.lexer.KtTokens.SUSPEND_KEYWORD)
@@ -427,9 +476,14 @@ class K2FullAnalyzer(
         val name = property.name ?: return
         val fqn = "$containerFqn.$name"
         
-        // Get property symbol for resolved/inferred type
-        val propertySymbol = property.symbol
-        val typeFqn = resolveTypeFqn(propertySymbol.returnType)
+        // Get property symbol for resolved/inferred type (with safe error handling)
+        val typeFqn = try {
+            val propertySymbol = property.symbol
+            resolveTypeFqn(propertySymbol.returnType)
+        } catch (e: Exception) {
+            logger.debug { "Property type resolution failed for $name: ${e.message}" }
+            property.typeReference?.text ?: "Unknown"
+        }
         
         val fieldNode = FieldNode(
             id = nextId(),
