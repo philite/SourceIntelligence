@@ -156,9 +156,9 @@ var indexCmd = &cobra.Command{
 			// --- CSV IMPORT PATH ---
 			fmt.Println("Loading CSV data into Memgraph (Server-side load)...")
 			
-			// Construct internal docker paths
-			nodesFileDocker := filepath.Join(importDirDocker, "nodes.csv")
-			relsFileDocker := filepath.Join(importDirDocker, "relationships.csv")
+			// Forces Linux forward slashes for Docker
+			nodesFileDocker := fmt.Sprintf("%s/nodes.csv", importDirDocker)
+			relsFileDocker := fmt.Sprintf("%s/relationships.csv", importDirDocker)
 
 			if err := client.ImportCSV(ctx, nodesFileDocker, relsFileDocker); err != nil {
 				return fmt.Errorf("\n❌ Import Failed: %w\n\nCheck your Docker volume mount:\n  - Host: %s\n  - Docker: %s", err, importDirHost, importDirDocker)
