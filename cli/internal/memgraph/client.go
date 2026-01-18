@@ -49,8 +49,75 @@ func (c *Client) Close(ctx context.Context) error {
 	return c.driver.Close(ctx)
 }
 
+// ----------------------------------------------------------------------------
+// NEW: Bulk Import Logic (CSV based)
+// ----------------------------------------------------------------------------
+
+// ImportCSV instructs Memgraph to load CSV files from a path INTERNAL to its container.
+// It switches to ANALYTICAL mode to bypass transaction overhead.
+func (c *Client) ImportCSV(ctx context.Context, nodesPathInternal, relsPathInternal string) error {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
+	defer session.Close(ctx)
+
+	// 1. Switch to Analytical mode
+	// This disables undo/rollback logs (Deltas), making imports 5-10x faster and memory efficient.
+	// Essential for bulk loading >10k items.
+	fmt.Println("   [Memgraph] Switching to ANALYTICAL mode...")
+	if _, err := session.Run(ctx, "STORAGE MODE IN_MEMORY_ANALYTICAL", nil); err != nil {
+		return fmt.Errorf("failed to set analytical mode: %w", err)
+	}
+
+	// 2. Import Nodes
+	// We use APOC to handle the JSON properties column and dynamic labels.
+	// NOTE: Memgraph Mage (or APOC) must be installed in your Docker image.
+	fmt.Println("   [Memgraph] Importing Nodes from CSV...")
+	nodeQuery := fmt.Sprintf(`
+		LOAD CSV FROM "%s" WITH HEADER AS row
+		CREATE (n)
+		SET n = apoc.convert.fromJsonMap(row.properties)
+		SET n.id = row.id
+		WITH n, row
+		CALL apoc.create.addLabels(n, split(row.labels, ":")) YIELD node
+		RETURN count(*) as count
+	`, nodesPathInternal)
+
+	if _, err := session.Run(ctx, nodeQuery, nil); err != nil {
+		// Attempt to switch back before returning error, just in case
+		_, _ = session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil)
+		return fmt.Errorf("node import failed: %w", err)
+	}
+
+	// 3. Import Relationships
+	// Matches nodes by 'id' and creates the edge with dynamic type and properties.
+	fmt.Println("   [Memgraph] Importing Relationships from CSV...")
+	relQuery := fmt.Sprintf(`
+		LOAD CSV FROM "%s" WITH HEADER AS row
+		MATCH (start {id: row.start_id})
+		MATCH (end {id: row.end_id})
+		CALL apoc.create.relationship(start, row.type, apoc.convert.fromJsonMap(row.properties), end) YIELD rel
+		RETURN count(*) as count
+	`, relsPathInternal)
+
+	if _, err := session.Run(ctx, relQuery, nil); err != nil {
+		_, _ = session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil)
+		return fmt.Errorf("relationship import failed: %w", err)
+	}
+
+	// 4. Switch back to Transactional mode
+	// Restore standard ACID compliance for future small updates.
+	fmt.Println("   [Memgraph] Switching back to TRANSACTIONAL mode...")
+	if _, err := session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil); err != nil {
+		return fmt.Errorf("failed to restore transactional mode: %w", err)
+	}
+
+	return nil
+}
+
+// ----------------------------------------------------------------------------
+// Legacy: In-Memory Load Logic (Keep for backward compatibility)
+// ----------------------------------------------------------------------------
+
 // LoadGraph loads a CodeGraph JSON into Memgraph
-// If useMerge is true, uses MERGE to update existing nodes instead of CREATE
 func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte, useMerge bool) error {
 	var graph CodeGraph
 	if err := json.Unmarshal(graphJSON, &graph); err != nil {
@@ -70,12 +137,12 @@ func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte, useMerge bool)
 		nodes = append(nodes, node)
 	}
 
-	// Batch create nodes (grouped by labels)
+	// Batch create nodes
 	if err := c.batchCreateNodes(ctx, session, nodes, useMerge); err != nil {
 		return err
 	}
 
-	// Batch create relationships (grouped by type)
+	// Batch create relationships
 	if err := c.batchCreateRelationships(ctx, session, graph.Relationships, useMerge); err != nil {
 		return err
 	}
@@ -85,11 +152,8 @@ func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte, useMerge bool)
 
 const batchSize = 500
 
-// batchCreateNodes creates nodes in batches using UNWIND, grouped by label combination
 func (c *Client) batchCreateNodes(ctx context.Context, session neo4j.SessionWithContext, nodes []GenericNode, useMerge bool) error {
-	// Group nodes by their label combination
 	groups := make(map[string][]map[string]any)
-	
 	for _, node := range nodes {
 		labels := ""
 		for i, label := range node.Labels {
@@ -104,7 +168,6 @@ func (c *Client) batchCreateNodes(ctx context.Context, session neo4j.SessionWith
 
 	totalCreated := 0
 	for labels, nodeProps := range groups {
-		// Process in batches
 		for i := 0; i < len(nodeProps); i += batchSize {
 			end := i + batchSize
 			if end > len(nodeProps) {
@@ -131,22 +194,14 @@ func (c *Client) batchCreateNodes(ctx context.Context, session neo4j.SessionWith
 			if err != nil {
 				return fmt.Errorf("failed to batch create nodes with labels %s: %w", labels, err)
 			}
-			
 			totalCreated += len(batch)
-			if totalCreated%5000 == 0 || totalCreated == len(nodes) {
-				fmt.Printf("Created %d/%d nodes...\n", totalCreated, len(nodes))
-			}
 		}
 	}
-	
 	return nil
 }
 
-// batchCreateRelationships creates relationships in batches using UNWIND, grouped by type
 func (c *Client) batchCreateRelationships(ctx context.Context, session neo4j.SessionWithContext, rels []GraphRelationship, useMerge bool) error {
-	// Group relationships by type
 	groups := make(map[string][]map[string]any)
-	
 	for _, rel := range rels {
 		props := make(map[string]any)
 		props["id"] = rel.ID
@@ -158,9 +213,7 @@ func (c *Client) batchCreateRelationships(ctx context.Context, session neo4j.Ses
 		groups[rel.Type] = append(groups[rel.Type], props)
 	}
 
-	totalCreated := 0
 	for relType, relProps := range groups {
-		// Process in batches
 		for i := 0; i < len(relProps); i += batchSize {
 			end := i + batchSize
 			if end > len(relProps) {
@@ -189,76 +242,14 @@ func (c *Client) batchCreateRelationships(ctx context.Context, session neo4j.Ses
 			if err != nil {
 				return fmt.Errorf("failed to batch create relationships of type %s: %w", relType, err)
 			}
-			
-			totalCreated += len(batch)
-			if totalCreated%10000 == 0 || totalCreated == len(rels) {
-				fmt.Printf("Created %d/%d relationships...\n", totalCreated, len(rels))
-			}
 		}
 	}
-	
 	return nil
 }
 
-func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContext, node GenericNode, useMerge bool) error {
-	// Build labels string
-	labels := ""
-	for i, label := range node.Labels {
-		if i > 0 {
-			labels += ":"
-		}
-		labels += label
-	}
-
-	// Get merged properties (includes name, fqn, etc.)
-	props := node.ToProperties()
-
-	var query string
-	if useMerge {
-		// MERGE by FQN if available, otherwise by ID
-		if fqn, ok := props["fqn"].(string); ok && fqn != "" {
-			query = fmt.Sprintf("MERGE (n:%s {fqn: $fqn}) SET n += $props", labels)
-			props["fqn"] = fqn // ensure fqn is in props
-		} else {
-			query = fmt.Sprintf("MERGE (n:%s {id: $id}) SET n += $props", labels)
-		}
-	} else {
-		query = fmt.Sprintf("CREATE (n:%s $props)", labels)
-	}
-	
-	_, err := session.Run(ctx, query, map[string]any{"props": props, "fqn": props["fqn"], "id": props["id"]})
-	return err
-}
-
-func (c *Client) createRelationship(ctx context.Context, session neo4j.SessionWithContext, rel GraphRelationship, useMerge bool) error {
-	props := make(map[string]any)
-	props["id"] = rel.ID
-	for k, v := range rel.Properties {
-		props[k] = v
-	}
-
-	var query string
-	if useMerge {
-		// MERGE relationship by matching start/end nodes
-		query = `
-			MATCH (a {id: $startId}), (b {id: $endId})
-			MERGE (a)-[r:` + rel.Type + `]->(b)
-			SET r += $props
-		`
-	} else {
-		query = `
-			MATCH (a {id: $startId}), (b {id: $endId})
-			CREATE (a)-[r:` + rel.Type + ` $props]->(b)
-		`
-	}
-
-	_, err := session.Run(ctx, query, map[string]any{
-		"startId": rel.StartNodeID,
-		"endId":   rel.EndNodeID,
-		"props":   props,
-	})
-	return err
-}
+// ----------------------------------------------------------------------------
+// Utility / Query Methods
+// ----------------------------------------------------------------------------
 
 // Query executes a Cypher query and returns results as JSON
 func (c *Client) Query(ctx context.Context, cypher string) ([]map[string]any, error) {
@@ -301,25 +292,20 @@ func (c *Client) ClearDatabase(ctx context.Context) error {
 	return err
 }
 
-// EnsureIndexes creates necessary indexes to speed up ingestion
-func (c *Client) EnsureIndexes(ctx context.Context, labels []string) error {
-    session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
-    defer session.Close(ctx)
+// InitSchema creates indexes and constraints in Memgraph
+// NOTE: We moved Schema definition here or you can keep it in schema.go
+func (c *Client) InitSchema(ctx context.Context) error {
+	// Re-using the logic from your original schema.go
+	// If Schema variable is defined in schema.go (same package), it is accessible here.
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
+	defer session.Close(ctx)
 
-    for _, label := range labels {
-        // This creates a uniqueness constraint which creates an underlying index
-        // changing linear scan O(N) to O(log N)
-        query := fmt.Sprintf("CREATE CONSTRAINT ON (n:%s) ASSERT n.id IS UNIQUE;", label)
-        
-        // Note: In Memgraph, if it exists it might error or warn, 
-        // strictly you might want to check existence first or ignore specific errors.
-        _, err := session.Run(ctx, query, nil)
-        if err != nil {
-            // Log warning but don't fail if it simply already exists
-            fmt.Printf("Warning creating index for %s (might already exist): %v\n", label, err)
-        } else {
-            fmt.Printf("Index created for label: %s\n", label)
-        }
-    }
-    return nil
+	// Ensure Schema is available. If it's in schema.go, it works.
+	// Otherwise, define it here or pass it in.
+	for _, stmt := range Schema {
+		if _, err := session.Run(ctx, stmt, nil); err != nil {
+			continue
+		}
+	}
+	return nil
 }

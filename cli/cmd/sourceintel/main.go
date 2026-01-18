@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sourceintel/cli/internal/analyzer"
+	"github.com/sourceintel/cli/internal/exporter"
 	"github.com/sourceintel/cli/internal/memgraph"
 	mcp_server "github.com/sourceintel/cli/internal/mcp"
 	"github.com/sourceintel/cli/internal/query"
@@ -21,6 +22,8 @@ var (
 	memgraphPassword string
 	outputFormat     string
 	analyzerGrpc     string
+	importDirHost string // e.g., /Users/me/tmp/import
+    importDirDocker string // e.g., /var/lib/memgraph/import
 )
 
 var rootCmd = &cobra.Command{
@@ -38,79 +41,92 @@ var indexCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		projectPath := args[0]
 		moduleName, _ := cmd.Flags().GetString("module")
-		analyzerDir, _ := cmd.Flags().GetString("analyzer-dir")
+		analyzerDir, _ := cmd.Flags().GetString("analyzer-dir") // Fallback for non-gRPC mode
 		semantic, _ := cmd.Flags().GetBool("semantic")
 		fullK2, _ := cmd.Flags().GetBool("full-k2")
 		android, _ := cmd.Flags().GetBool("android")
 		clearFirst, _ := cmd.Flags().GetBool("clear")
-		useMerge, _ := cmd.Flags().GetBool("merge")
 		grpcAddr, _ := cmd.Flags().GetString("analyzer-grpc")
-		
+
 		fmt.Printf("Indexing project: %s\n", projectPath)
-		
-		var graph *memgraph.CodeGraph
+
+		// 1. Resolve Absolute Path
+		// Use path as-is if it starts with / (container path), otherwise convert to absolute
+		analyzerPath := projectPath
+		if len(projectPath) > 0 && projectPath[0] != '/' {
+			absProjectPath, err := filepath.Abs(projectPath)
+			if err != nil {
+				return fmt.Errorf("failed to resolve absolute path: %w", err)
+			}
+			analyzerPath = absProjectPath
+		}
+
+		// 2. Setup CSV Exporter (Prepare the files on disk)
+		// We only do this if we are using gRPC, as the streaming optimization is built for it.
+		var csvExp *exporter.CSVExporter
 		var err error
 		
-		// Use gRPC if address provided, otherwise use subprocess
+		if grpcAddr != "" {
+			fmt.Printf("Preparing CSV export in: %s\n", importDirHost)
+			csvExp, err = exporter.NewCSVExporter(importDirHost)
+			if err != nil {
+				return fmt.Errorf("failed to create CSV exporter: %w", err)
+			}
+			defer csvExp.Close()
+		}
+
+		// 3. Run Analysis
+		// We track stats to print later
+		var nodeCount, relCount int
+		var graph *memgraph.CodeGraph // Used only for legacy non-gRPC mode
+
 		if grpcAddr != "" {
 			fmt.Printf("Using gRPC analyzer at %s\n", grpcAddr)
 			if fullK2 {
-				fmt.Println("Running full K2 semantic analyzer via gRPC (this may take a while)...")
+				fmt.Println("Running full K2 semantic analyzer via gRPC (streaming to CSV)...")
 			} else {
 				fmt.Println("Running analyzer via gRPC...")
 			}
-			
-			// Create a long timeout context for analysis
+
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
-			
-			// Use path as-is if it starts with / (container path), otherwise convert to absolute
-			analyzerPath := projectPath
-			if len(projectPath) > 0 && projectPath[0] != '/' {
-				absProjectPath, err := filepath.Abs(projectPath)
-				if err != nil {
-					return fmt.Errorf("failed to resolve absolute path: %w", err)
-				}
-				analyzerPath = absProjectPath
-			}
-			
+
 			grpcAnalyzer := analyzer.NewGrpcAnalyzer(grpcAddr)
-			graph, err = grpcAnalyzer.AnalyzeProject(ctx, analyzerPath, moduleName, fullK2, android)
+			
+			// Call the NEW method that streams to CSV instead of returning a struct
+			nodeCount, relCount, err = grpcAnalyzer.AnalyzeAndExport(
+				ctx, analyzerPath, moduleName, fullK2, android, csvExp,
+			)
 			if err != nil {
 				return fmt.Errorf("gRPC analysis failed: %w", err)
 			}
+			
+			fmt.Printf("✓ Analysis complete. Streamed %d nodes and %d relationships to disk.\n", nodeCount, relCount)
+
 		} else {
-			// Auto-detect analyzer directory if not explicitly correctly set or using default
+			// Legacy/Subprocess Mode (Keep this if you ever need to run without gRPC)
+			// This loads everything into RAM.
 			if analyzerDir == "../analyzer" {
 				if foundDir, err := analyzer.FindAnalyzerDir(); err == nil {
 					analyzerDir = foundDir
 				}
 			}
-
-			// Create analyzer
 			a := analyzer.NewAnalyzer(analyzerDir)
+			fmt.Println("Running analyzer in subprocess mode (RAM heavy)...")
 			
-			// Analyze project
-			if fullK2 {
-				fmt.Println("Running full K2 semantic analyzer (this may take a while)...")
-			} else if semantic {
-				fmt.Println("Running PSI-enhanced analyzer...")
-			} else {
-				fmt.Println("Running Kotlin analyzer...")
-			}
 			graph, err = a.AnalyzeProject(projectPath, moduleName, semantic, fullK2, android)
 			if err != nil {
 				return fmt.Errorf("analysis failed: %w", err)
 			}
+			nodeCount = len(graph.Nodes)
+			relCount = len(graph.Relationships)
 		}
-		
-		fmt.Printf("Found %d nodes and %d relationships\n", len(graph.Nodes), len(graph.Relationships))
-		
-		// Connect to Memgraph
+
+		// 4. Connect to Memgraph
 		fmt.Println("Connecting to Memgraph...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // Increased timeout for load
 		defer cancel()
-		
+
 		client, err := memgraph.NewClient(memgraph.Config{
 			URI:      memgraphURI,
 			Username: memgraphUser,
@@ -120,32 +136,44 @@ var indexCmd = &cobra.Command{
 			return fmt.Errorf("failed to connect: %w", err)
 		}
 		defer client.Close(ctx)
-		
-		// Clear database if requested
+
+		// 5. Clear Database
 		if clearFirst {
 			fmt.Println("Clearing existing graph...")
 			if err := client.ClearDatabase(ctx); err != nil {
 				return fmt.Errorf("clear failed: %w", err)
 			}
 		}
-		
-		// Initialize schema
+
+		// 6. Initialize Schema (Indexes are crucial for import speed)
 		fmt.Println("Initializing schema...")
 		if err := client.InitSchema(ctx); err != nil {
 			return fmt.Errorf("schema init failed: %w", err)
 		}
-		
-		// Load graph (with merge if requested)
-		if useMerge {
-			fmt.Println("Merging graph into Memgraph (incremental update)...")
+
+		// 7. Load Data into Memgraph
+		if grpcAddr != "" {
+			// --- CSV IMPORT PATH ---
+			fmt.Println("Loading CSV data into Memgraph (Server-side load)...")
+			
+			// Construct internal docker paths
+			nodesFileDocker := filepath.Join(importDirDocker, "nodes.csv")
+			relsFileDocker := filepath.Join(importDirDocker, "relationships.csv")
+
+			if err := client.ImportCSV(ctx, nodesFileDocker, relsFileDocker); err != nil {
+				return fmt.Errorf("\n❌ Import Failed: %w\n\nCheck your Docker volume mount:\n  - Host: %s\n  - Docker: %s", err, importDirHost, importDirDocker)
+			}
 		} else {
-			fmt.Println("Loading graph into Memgraph...")
+			// --- LEGACY RAM PATH ---
+			fmt.Println("Loading graph object into Memgraph (Client-side load)...")
+			graphJSON, _ := json.Marshal(graph)
+			// Note: This relies on the old LoadGraph method. 
+			// If you want to force everything to CSV, you would need to convert 'graph' to CSV here too.
+			if err := client.LoadGraph(ctx, graphJSON, false); err != nil {
+				return fmt.Errorf("graph load failed: %w", err)
+			}
 		}
-		graphJSON, _ := json.Marshal(graph)
-		if err := client.LoadGraph(ctx, graphJSON, useMerge); err != nil {
-			return fmt.Errorf("graph load failed: %w", err)
-		}
-		
+
 		fmt.Println("✓ Indexing complete!")
 		return nil
 	},
@@ -344,6 +372,9 @@ func init() {
 	rootCmd.AddCommand(findCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(statusCmd)
+
+	indexCmd.Flags().StringVar(&importDirHost, "import-host", "./import_data", "Local directory to write CSVs to")
+    indexCmd.Flags().StringVar(&importDirDocker, "import-docker", "/var/lib/memgraph/import", "Path to that directory inside the Memgraph container")
 }
 
 func main() {

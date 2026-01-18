@@ -2,6 +2,7 @@ plugins {
     kotlin("jvm") version "2.1.21"
     kotlin("plugin.serialization") version "2.1.21"
     application
+    id("com.google.protobuf") version "0.9.4"
 }
 
 group = "com.sourceintel"
@@ -75,6 +76,12 @@ dependencies {
     implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
     implementation("ch.qos.logback:logback-classic:1.5.24")
     
+    // gRPC for server-streaming communication
+    implementation("io.grpc:grpc-kotlin-stub:1.4.1")
+    implementation("io.grpc:grpc-netty-shaded:1.62.2")
+    implementation("io.grpc:grpc-protobuf:1.62.2")
+    implementation("com.google.protobuf:protobuf-kotlin:3.25.3")
+    
     // Testing
     testImplementation(kotlin("test"))
     testImplementation("io.kotest:kotest-runner-junit5:5.9.1")
@@ -109,3 +116,37 @@ tasks.named<JavaExec>("run") {
     standardInput = System.`in`
 }
 
+// Protobuf/gRPC code generation configuration
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:3.25.3"
+    }
+    plugins {
+        create("grpc") {
+            artifact = "io.grpc:protoc-gen-grpc-java:1.62.2"
+        }
+        create("grpckt") {
+            artifact = "io.grpc:protoc-gen-grpc-kotlin:1.4.1:jdk8@jar"
+        }
+    }
+    generateProtoTasks {
+        all().forEach { task ->
+            task.plugins {
+                create("grpc")
+                create("grpckt")
+            }
+            task.builtins {
+                create("kotlin")
+            }
+        }
+    }
+}
+
+// Include proto files from project root
+sourceSets {
+    main {
+        proto {
+            srcDir("../proto")
+        }
+    }
+}

@@ -31,6 +31,7 @@ services:
     volumes:
       - memgraph_data:/var/lib/memgraph
       - memgraph_log:/var/log/memgraph
+      - C:/Users/Phil/Documents/Playground/SourceIntelligence/import_data:/var/lib/memgraph/import
     command: ["--log-level=WARNING"]
     healthcheck:
       test: ["CMD", "mg_client", "--host", "localhost", "--port", "7687", "--execute", "RETURN 1;"]

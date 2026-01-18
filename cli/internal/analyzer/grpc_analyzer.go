@@ -2,19 +2,19 @@ package analyzer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
+	"time"
 
-	"github.com/sourceintel/cli/internal/memgraph"
+	"github.com/sourceintel/cli/internal/exporter"
+	"github.com/sourceintel/cli/internal/memgraph" // Needed for legacy AnalyzeProject
 	pb "github.com/sourceintel/cli/pkg/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"encoding/json"
 )
 
 // GrpcAnalyzer uses gRPC to communicate with the Kotlin analyzer server.
-// This is the preferred mode for large projects as it supports streaming.
 type GrpcAnalyzer struct {
 	address string
 	conn    *grpc.ClientConn
@@ -51,17 +51,17 @@ func (a *GrpcAnalyzer) Close() {
 	}
 }
 
-// AnalyzeProject analyzes a project and returns the complete graph.
-// For large projects, consider using AnalyzeProjectStream instead.
-func (a *GrpcAnalyzer) AnalyzeProject(
+// AnalyzeAndExport streams data from gRPC directly to CSV files (THE NEW FAST METHOD)
+func (a *GrpcAnalyzer) AnalyzeAndExport(
 	ctx context.Context,
 	projectPath string,
 	moduleName string,
 	fullK2 bool,
 	android bool,
-) (*memgraph.CodeGraph, error) {
+	csvExporter *exporter.CSVExporter,
+) (int, int, error) {
 	if err := a.connect(); err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 	defer a.Close()
 
@@ -74,96 +74,113 @@ func (a *GrpcAnalyzer) AnalyzeProject(
 
 	stream, err := a.client.Analyze(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("gRPC analyze failed: %w", err)
+		return 0, 0, fmt.Errorf("gRPC analyze failed: %w", err)
 	}
 
-	// Collect results from stream
-	var meta *pb.GraphMeta
-	nodes := make([]json.RawMessage, 0)
-	relationships := make([]memgraph.GraphRelationship, 0)
+	nodeCount := 0
+	relCount := 0
+	lastLog := time.Now()
 
 	for {
 		event, err := stream.Recv()
 		if err == io.EOF {
-			fmt.Printf("Stream complete. Received %d nodes, %d relationships\n", len(nodes), len(relationships))
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("stream receive failed: %w", err)
+			return nodeCount, relCount, fmt.Errorf("stream receive failed: %w", err)
 		}
 
 		switch e := event.Event.(type) {
-		case *pb.AnalysisEvent_Meta:
-			meta = e.Meta
-			fmt.Printf("Received metadata: language=%s, projectType=%s\n", meta.Language, meta.ProjectType)
 		case *pb.AnalysisEvent_Node:
-			// Convert proto node to JSON for memgraph
-			nodeJSON, _ := json.Marshal(protoNodeToMap(e.Node))
-			nodes = append(nodes, nodeJSON)
-			if len(nodes)%1000 == 0 {
-				fmt.Printf("Received %d nodes...\n", len(nodes))
+			if err := csvExporter.WriteNode(e.Node); err != nil {
+				return nodeCount, relCount, err
 			}
+			nodeCount++
 		case *pb.AnalysisEvent_Relationship:
-			relationships = append(relationships, memgraph.GraphRelationship{
-				ID:          e.Relationship.Id,
-				Type:        e.Relationship.Type,
-				StartNodeID: e.Relationship.StartNodeId,
-				EndNodeID:   e.Relationship.EndNodeId,
-				Properties:  e.Relationship.Properties,
-			})
-			if len(relationships)%5000 == 0 {
-				fmt.Printf("Received %d relationships...\n", len(relationships))
+			if err := csvExporter.WriteRelationship(e.Relationship); err != nil {
+				return nodeCount, relCount, err
 			}
+			relCount++
 		case *pb.AnalysisEvent_Error:
 			if e.Error.Fatal {
-				return nil, fmt.Errorf("analysis error: %s (file: %s)", e.Error.Message, e.Error.File)
+				return nodeCount, relCount, fmt.Errorf("analysis fatal error: %s", e.Error.Message)
 			}
-			// Non-fatal errors are logged but don't stop processing
-		case *pb.AnalysisEvent_Complete:
-			fmt.Printf("Server reported complete: %d nodes, %d relationships in %dms\n", 
-				e.Complete.TotalNodes, e.Complete.TotalRelationships, e.Complete.DurationMs)
+			fmt.Printf("Analysis warning: %s\n", e.Error.Message)
+		}
+
+		// Progress logging
+		if time.Since(lastLog) > 2*time.Second {
+			fmt.Printf("Streaming... %d nodes, %d relationships written\n", nodeCount, relCount)
+			lastLog = time.Now()
 		}
 	}
-
-	// Build the CodeGraph
-	graph := &memgraph.CodeGraph{
-		Nodes:         nodes,
-		Relationships: relationships,
-	}
-
-	if meta != nil {
-		graph.Meta = memgraph.GraphMeta{
-			Language:      meta.Language,
-			ProjectType:   meta.ProjectType,
-			SchemaVersion: meta.SchemaVersion,
-			AnalyzedAt:    meta.AnalyzedAt,
-			ProjectPath:   meta.ProjectPath,
-		}
-	}
-
-	return graph, nil
+    
+	// Ensure all data is flushed to disk
+	csvExporter.Close() 
+	return nodeCount, relCount, nil
 }
 
-// protoNodeToMap converts a proto GraphNode to a map for JSON serialization
-func protoNodeToMap(node *pb.GraphNode) map[string]any {
-	m := make(map[string]any)
-	m["id"] = node.Id
-	m["type"] = node.Type
-	m["labels"] = node.Labels
-	
-	// Copy all properties, converting numeric strings to integers where needed
-	for k, v := range node.Properties {
-		// Convert known numeric fields to int
-		if k == "line" {
-			if lineNum, err := strconv.Atoi(v); err == nil {
-				m[k] = lineNum
-			} else {
-				m[k] = 0
-			}
-		} else {
-			m[k] = v
-		}
-	}
-	
-	return m
+// AnalyzeProject returns the legacy CodeGraph struct (Only needed if you use non-CSV mode)
+func (a *GrpcAnalyzer) AnalyzeProject(
+	ctx context.Context,
+	projectPath string,
+	moduleName string,
+	fullK2 bool,
+	android bool,
+) (*memgraph.CodeGraph, error) {
+	// ... (We can keep this stub or the full implementation if you still need legacy support)
+    // For now, let's include the implementation to satisfy any other code calling it.
+    
+    if err := a.connect(); err != nil {
+        return nil, err
+    }
+    defer a.Close()
+
+    req := &pb.AnalyzeRequest{
+        ProjectPath: projectPath,
+        ModuleName:  moduleName,
+        FullK2:      fullK2,
+        Android:     android,
+    }
+
+    stream, err := a.client.Analyze(ctx, req)
+    if err != nil {
+        return nil, err
+    }
+
+    nodes := make([]json.RawMessage, 0)
+    relationships := make([]memgraph.GraphRelationship, 0)
+
+    for {
+        event, err := stream.Recv()
+        if err == io.EOF { break }
+        if err != nil { return nil, err }
+
+        switch e := event.Event.(type) {
+        case *pb.AnalysisEvent_Node:
+             // We need the helper function 'protoNodeToMap' here or copied
+             m := make(map[string]any)
+             m["id"] = e.Node.Id
+             m["type"] = e.Node.Type
+             m["labels"] = e.Node.Labels
+             for k, v := range e.Node.Properties { m[k] = v }
+             
+             nodeJSON, _ := json.Marshal(m)
+             nodes = append(nodes, nodeJSON)
+             
+        case *pb.AnalysisEvent_Relationship:
+            relationships = append(relationships, memgraph.GraphRelationship{
+                ID:          e.Relationship.Id,
+                Type:        e.Relationship.Type,
+                StartNodeID: e.Relationship.StartNodeId,
+                EndNodeID:   e.Relationship.EndNodeId,
+                Properties:  e.Relationship.Properties,
+            })
+        }
+    }
+
+    return &memgraph.CodeGraph{
+        Nodes:         nodes,
+        Relationships: relationships,
+    }, nil
 }

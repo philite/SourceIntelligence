@@ -1,12 +1,7 @@
 package memgraph
 
-import (
-	"context"
-	
-	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
-)
-
 // Schema contains the Cypher statements to initialize the graph schema
+// Note: The InitSchema() function has been moved to client.go
 var Schema = []string{
 	// Core indexes for faster lookups
 	"CREATE INDEX ON :Type(fqn)",
@@ -17,7 +12,7 @@ var Schema = []string{
 	"CREATE INDEX ON :Module(name)",
 	"CREATE INDEX ON :Package(fqn)",
 	"CREATE INDEX ON :File(path)",
-	
+
 	// Architecture-specific indexes
 	"CREATE INDEX ON :ViewModel(fqn)",
 	"CREATE INDEX ON :UseCase(fqn)",
@@ -25,22 +20,8 @@ var Schema = []string{
 	"CREATE INDEX ON :DataSource(fqn)",
 	"CREATE INDEX ON :Activity(fqn)",
 	"CREATE INDEX ON :Fragment(fqn)",
-	
+
 	// Unique constraint on id
 	"CREATE CONSTRAINT ON (n:Type) ASSERT n.id IS UNIQUE",
 	"CREATE CONSTRAINT ON (n:Function) ASSERT n.id IS UNIQUE",
-}
-
-// InitSchema creates indexes and constraints in Memgraph
-func (c *Client) InitSchema(ctx context.Context) error {
-	session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
-	defer session.Close(ctx)
-
-	for _, stmt := range Schema {
-		if _, err := session.Run(ctx, stmt, nil); err != nil {
-			// Ignore errors for already existing indexes/constraints
-			continue
-		}
-	}
-	return nil
 }
