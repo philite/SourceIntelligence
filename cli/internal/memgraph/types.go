@@ -23,7 +23,7 @@ type GenericNode struct {
 	Type       string            `json:"type"`
 	ID         string            `json:"id"`
 	Labels     []string          `json:"labels"`
-	Properties map[string]string `json:"properties"`
+	Properties map[string]any    `json:"properties"`
 	// Common additional fields from Kotlin nodes
 	Name      string `json:"name,omitempty"`
 	Fqn       string `json:"fqn,omitempty"`
@@ -117,5 +117,5 @@ type GraphRelationship struct {
 	Type        string            `json:"type"`
 	StartNodeID string            `json:"startNodeId"`
 	EndNodeID   string            `json:"endNodeId"`
-	Properties  map[string]string `json:"properties"`
+	Properties  map[string]any    `json:"properties"`
 }

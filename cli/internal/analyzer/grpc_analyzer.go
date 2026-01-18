@@ -169,12 +169,16 @@ func (a *GrpcAnalyzer) AnalyzeProject(
              nodes = append(nodes, nodeJSON)
              
         case *pb.AnalysisEvent_Relationship:
+			props := make(map[string]any)
+			for k, v := range e.Relationship.Properties {
+				props[k] = v
+			}
             relationships = append(relationships, memgraph.GraphRelationship{
                 ID:          e.Relationship.Id,
                 Type:        e.Relationship.Type,
                 StartNodeID: e.Relationship.StartNodeId,
                 EndNodeID:   e.Relationship.EndNodeId,
-                Properties:  e.Relationship.Properties,
+                Properties:  props,
             })
         }
     }

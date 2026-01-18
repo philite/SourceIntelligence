@@ -154,14 +154,14 @@ var indexCmd = &cobra.Command{
 		// 7. Load Data into Memgraph
 		if grpcAddr != "" {
 			// --- CSV IMPORT PATH ---
-			fmt.Println("Loading CSV data into Memgraph (Server-side load)...")
+			fmt.Println("Loading CSV data into Memgraph (via Go batching)...")
 			
-			// Forces Linux forward slashes for Docker
-			nodesFileDocker := fmt.Sprintf("%s/nodes.csv", importDirDocker)
-			relsFileDocker := fmt.Sprintf("%s/relationships.csv", importDirDocker)
+			// Use HOST paths because Go client reads them directly
+			nodesFile := filepath.Join(importDirHost, "nodes.csv")
+			relsFile := filepath.Join(importDirHost, "relationships.csv")
 
-			if err := client.ImportCSV(ctx, nodesFileDocker, relsFileDocker); err != nil {
-				return fmt.Errorf("\n❌ Import Failed: %w\n\nCheck your Docker volume mount:\n  - Host: %s\n  - Docker: %s", err, importDirHost, importDirDocker)
+			if err := client.ImportCSV(ctx, nodesFile, relsFile); err != nil {
+				return fmt.Errorf("Import Failed: %w", err)
 			}
 		} else {
 			// --- LEGACY RAM PATH ---

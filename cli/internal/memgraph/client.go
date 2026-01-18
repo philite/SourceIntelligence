@@ -2,8 +2,12 @@ package memgraph
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
@@ -53,62 +57,170 @@ func (c *Client) Close(ctx context.Context) error {
 // NEW: Bulk Import Logic (CSV based)
 // ----------------------------------------------------------------------------
 
-// ImportCSV instructs Memgraph to load CSV files from a path INTERNAL to its container.
-// It switches to ANALYTICAL mode to bypass transaction overhead.
-func (c *Client) ImportCSV(ctx context.Context, nodesPathInternal, relsPathInternal string) error {
+// ImportCSV reads CSV files from Host path and imports them into Memgraph via Go batching.
+// This creates a robust import that works without APOC or specific Memgraph modules.
+func (c *Client) ImportCSV(ctx context.Context, nodesPath, relsPath string) error {
 	session := c.driver.NewSession(ctx, neo4j.SessionConfig{})
 	defer session.Close(ctx)
 
-	// 1. Switch to Analytical mode
-	// This disables undo/rollback logs (Deltas), making imports 5-10x faster and memory efficient.
-	// Essential for bulk loading >10k items.
+	// 1. Switch to Analytical mode for performance
 	fmt.Println("   [Memgraph] Switching to ANALYTICAL mode...")
 	if _, err := session.Run(ctx, "STORAGE MODE IN_MEMORY_ANALYTICAL", nil); err != nil {
 		return fmt.Errorf("failed to set analytical mode: %w", err)
 	}
 
-	// 2. Import Nodes
-	// We use json_util from MAGE to handle the JSON properties column.
-	fmt.Println("   [Memgraph] Importing Nodes from CSV...")
-	nodeQuery := fmt.Sprintf(`
-		LOAD CSV FROM "%s" WITH HEADER AS row
-		CREATE (n)
-		SET n = json_util.load_from_string(row.properties)
-		SET n.id = row.id
-		WITH n, row
-		CALL apoc.create.addLabels(n, split(row.labels, ":")) YIELD node
-		RETURN count(*) as count
-	`, nodesPathInternal)
+	// Helper to restore mode on exit
+	defer func() {
+		fmt.Println("   [Memgraph] Switching back to TRANSACTIONAL mode...")
+		session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil)
+	}()
 
-	if _, err := session.Run(ctx, nodeQuery, nil); err != nil {
-		// Attempt to switch back before returning error, just in case
-		_, _ = session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil)
-		return fmt.Errorf("node import failed: %w", err)
+	// 2. Import Nodes
+	fmt.Println("   [Memgraph] Importing Nodes from CSV stream...")
+	if err := c.importNodesFromCSV(ctx, session, nodesPath); err != nil {
+		return err
 	}
 
 	// 3. Import Relationships
-	// Matches nodes by 'id' and creates the edge with dynamic type and properties.
-	fmt.Println("   [Memgraph] Importing Relationships from CSV...")
-	relQuery := fmt.Sprintf(`
-		LOAD CSV FROM "%s" WITH HEADER AS row
-		MATCH (start {id: row.start_id})
-		MATCH (end {id: row.end_id})
-		CALL apoc.create.relationship(start, row.type, json_util.load_from_string(row.properties), end) YIELD rel
-		RETURN count(*) as count
-	`, relsPathInternal)
-
-	if _, err := session.Run(ctx, relQuery, nil); err != nil {
-		_, _ = session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil)
-		return fmt.Errorf("relationship import failed: %w", err)
+	fmt.Println("   [Memgraph] Importing Relationships from CSV stream...")
+	if err := c.importRelsFromCSV(ctx, session, relsPath); err != nil {
+		return err
 	}
 
-	// 4. Switch back to Transactional mode
-	// Restore standard ACID compliance for future small updates.
-	fmt.Println("   [Memgraph] Switching back to TRANSACTIONAL mode...")
-	if _, err := session.Run(ctx, "STORAGE MODE IN_MEMORY_TRANSACTIONAL", nil); err != nil {
-		return fmt.Errorf("failed to restore transactional mode: %w", err)
+	return nil
+}
+
+const csvReadBatch = 5000 // Read 5k lines at a time
+
+func (c *Client) importNodesFromCSV(ctx context.Context, session neo4j.SessionWithContext, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open nodes csv: %w", err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	// Read header
+	if _, err := r.Read(); err != nil {
+		return fmt.Errorf("failed to read header: %w", err)
 	}
 
+	nodesBatch := make([]GenericNode, 0, csvReadBatch)
+
+	for {
+		record, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("csv read error: %w", err)
+		}
+
+		// Row: id, labels, properties(json)
+		if len(record) < 3 {
+			continue
+		}
+
+		var props map[string]any
+		if err := json.Unmarshal([]byte(record[2]), &props); err != nil {
+			// Warn but continue? Or fail? Let's Log
+			fmt.Printf("Warning: failed to parse properties for node %s: %v\n", record[0], err)
+			props = make(map[string]any)
+		}
+
+		node := GenericNode{
+			ID:         record[0],
+			Labels:     strings.Split(record[1], ":"),
+			Properties: props,
+		}
+		nodesBatch = append(nodesBatch, node)
+
+		if len(nodesBatch) >= csvReadBatch {
+			if err := c.batchCreateNodes(ctx, session, nodesBatch, false); err != nil {
+				return err
+			}
+			nodesBatch = nodesBatch[:0]
+			fmt.Print(".")
+		}
+	}
+
+	// Flush remaining
+	if len(nodesBatch) > 0 {
+		if err := c.batchCreateNodes(ctx, session, nodesBatch, false); err != nil {
+			return err
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func (c *Client) importRelsFromCSV(ctx context.Context, session neo4j.SessionWithContext, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open rels csv: %w", err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	// Read header
+	if _, err := r.Read(); err != nil {
+		return fmt.Errorf("failed to read header: %w", err)
+	}
+
+	relsBatch := make([]GraphRelationship, 0, csvReadBatch)
+
+	for {
+		record, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("csv read error: %w", err)
+		}
+
+		// Row: start_id, end_id, type, properties(json)
+		if len(record) < 4 {
+			continue
+		}
+
+		var props map[string]any
+		if err := json.Unmarshal([]byte(record[3]), &props); err != nil {
+			props = make(map[string]any)
+		}
+
+		rel := GraphRelationship{
+			StartNodeID: record[0],
+			EndNodeID:   record[1],
+			Type:        record[2],
+			Properties:  props,
+			// ID is generated or not used in CREATE?
+			// Memgraph relationships store internal IDs usually.
+			// GraphRelationship struct has ID field.
+			// If we provided one in CSV, we could use it?
+			// The CSV doesn't seem to have a dedicated Rel ID column in header (start,end,type,props)
+			// Wait, in grpc_analyzer.go, we did NOT write Rel ID to CSV.
+			// Step 416: e.RelW.Write([]string{rel.StartNodeId, rel.EndNodeId, rel.Type, string(propsJson)})
+			// So Rel ID is effectively lost or assumed generated.
+			// GraphRelationship struct has ID field. We can leave it empty.
+		}
+		relsBatch = append(relsBatch, rel)
+
+		if len(relsBatch) >= csvReadBatch {
+			if err := c.batchCreateRelationships(ctx, session, relsBatch, false); err != nil {
+				return err
+			}
+			relsBatch = relsBatch[:0]
+			fmt.Print(".")
+		}
+	}
+
+	// Flush remaining
+	if len(relsBatch) > 0 {
+		if err := c.batchCreateRelationships(ctx, session, relsBatch, false); err != nil {
+			return err
+		}
+	}
+	fmt.Println()
 	return nil
 }
 
