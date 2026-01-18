@@ -39,6 +39,8 @@ var indexCmd = &cobra.Command{
 		analyzerDir, _ := cmd.Flags().GetString("analyzer-dir")
 		semantic, _ := cmd.Flags().GetBool("semantic")
 		fullK2, _ := cmd.Flags().GetBool("full-k2")
+		clearFirst, _ := cmd.Flags().GetBool("clear")
+		useMerge, _ := cmd.Flags().GetBool("merge")
 		
 		fmt.Printf("Indexing project: %s\n", projectPath)
 		
@@ -74,16 +76,28 @@ var indexCmd = &cobra.Command{
 		}
 		defer client.Close(ctx)
 		
+		// Clear database if requested
+		if clearFirst {
+			fmt.Println("Clearing existing graph...")
+			if err := client.ClearDatabase(ctx); err != nil {
+				return fmt.Errorf("clear failed: %w", err)
+			}
+		}
+		
 		// Initialize schema
 		fmt.Println("Initializing schema...")
 		if err := client.InitSchema(ctx); err != nil {
 			return fmt.Errorf("schema init failed: %w", err)
 		}
 		
-		// Load graph
-		fmt.Println("Loading graph into Memgraph...")
+		// Load graph (with merge if requested)
+		if useMerge {
+			fmt.Println("Merging graph into Memgraph (incremental update)...")
+		} else {
+			fmt.Println("Loading graph into Memgraph...")
+		}
 		graphJSON, _ := json.Marshal(graph)
-		if err := client.LoadGraph(ctx, graphJSON); err != nil {
+		if err := client.LoadGraph(ctx, graphJSON, useMerge); err != nil {
 			return fmt.Errorf("graph load failed: %w", err)
 		}
 		
@@ -184,6 +198,82 @@ var mcpCmd = &cobra.Command{
 	},
 }
 
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show graph database status and statistics",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		
+		client, err := memgraph.NewClient(memgraph.Config{
+			URI:      memgraphURI,
+			Username: memgraphUser,
+			Password: memgraphPassword,
+		})
+		if err != nil {
+			fmt.Println("❌ Memgraph: Not connected")
+			fmt.Printf("   Error: %v\n", err)
+			return nil
+		}
+		defer client.Close(ctx)
+		
+		fmt.Println("✅ Memgraph: Connected")
+		fmt.Printf("   URI: %s\n", memgraphURI)
+		
+		// Get node counts by label
+		countQuery := `
+			MATCH (n)
+			WITH labels(n) as nodeLabels
+			RETURN nodeLabels[0] as label, count(*) as count
+			ORDER BY count DESC
+			LIMIT 15
+		`
+		results, err := client.Query(ctx, countQuery)
+		if err != nil {
+			fmt.Printf("   ⚠️ Could not query stats: %v\n", err)
+			return nil
+		}
+		
+		if len(results) == 0 {
+			fmt.Println("\n📊 Graph Status: EMPTY")
+			fmt.Println("   Run 'sourceintel index <project-path>' to populate the graph.")
+			return nil
+		}
+		
+		fmt.Println("\n📊 Graph Statistics:")
+		totalNodes := 0
+		for _, row := range results {
+			label := row["label"]
+			count := row["count"]
+			if countInt, ok := count.(int64); ok {
+				totalNodes += int(countInt)
+				fmt.Printf("   %-20s %d\n", label, countInt)
+			}
+		}
+		
+		// Get total relationships
+		relQuery := `MATCH ()-[r]->() RETURN count(r) as count`
+		relResults, _ := client.Query(ctx, relQuery)
+		if len(relResults) > 0 {
+			if count, ok := relResults[0]["count"].(int64); ok {
+				fmt.Printf("\n   Total Nodes:         %d\n", totalNodes)
+				fmt.Printf("   Total Relationships: %d\n", count)
+			}
+		}
+		
+		// Get last analyzed project info if available
+		metaQuery := `MATCH (n) WHERE n.file IS NOT NULL RETURN n.file as file LIMIT 1`
+		metaResults, _ := client.Query(ctx, metaQuery)
+		if len(metaResults) > 0 {
+			if file, ok := metaResults[0]["file"].(string); ok && file != "" {
+				fmt.Printf("\n   Sample file: %s\n", file)
+			}
+		}
+		
+		return nil
+	},
+}
+
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&memgraphURI, "memgraph-uri", "bolt://localhost:7687", "Memgraph connection URI")
@@ -196,6 +286,8 @@ func init() {
 	indexCmd.Flags().String("analyzer-dir", "../analyzer", "Path to analyzer directory (containing gradlew)")
 	indexCmd.Flags().Bool("semantic", false, "Use PSI-enhanced semantic analysis (slower but more accurate)")
 	indexCmd.Flags().Bool("full-k2", false, "Use full K2 semantic analysis with classpath (slowest but most accurate)")
+	indexCmd.Flags().Bool("clear", false, "Clear existing graph before indexing (prevents duplicates)")
+	indexCmd.Flags().Bool("merge", false, "Use MERGE instead of CREATE for incremental updates")
 	
 	// Find command flags
 	findCmd.Flags().String("type", "", "Filter by symbol type (e.g., ViewModel, UseCase)")
@@ -204,6 +296,7 @@ func init() {
 	rootCmd.AddCommand(queryCmd)
 	rootCmd.AddCommand(findCmd)
 	rootCmd.AddCommand(mcpCmd)
+	rootCmd.AddCommand(statusCmd)
 }
 
 func main() {

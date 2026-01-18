@@ -50,7 +50,8 @@ func (c *Client) Close(ctx context.Context) error {
 }
 
 // LoadGraph loads a CodeGraph JSON into Memgraph
-func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte) error {
+// If useMerge is true, uses MERGE to update existing nodes instead of CREATE
+func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte, useMerge bool) error {
 	var graph CodeGraph
 	if err := json.Unmarshal(graphJSON, &graph); err != nil {
 		return fmt.Errorf("failed to parse graph JSON: %w", err)
@@ -65,14 +66,14 @@ func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte) error {
 		if err := json.Unmarshal(nodeRaw, &node); err != nil {
 			return fmt.Errorf("failed to parse node: %w", err)
 		}
-		if err := c.createNode(ctx, session, node); err != nil {
+		if err := c.createNode(ctx, session, node, useMerge); err != nil {
 			return fmt.Errorf("failed to create node %s: %w", node.ID, err)
 		}
 	}
 
 	// Create relationships
 	for _, rel := range graph.Relationships {
-		if err := c.createRelationship(ctx, session, rel); err != nil {
+		if err := c.createRelationship(ctx, session, rel, useMerge); err != nil {
 			return fmt.Errorf("failed to create relationship %s: %w", rel.ID, err)
 		}
 	}
@@ -80,7 +81,7 @@ func (c *Client) LoadGraph(ctx context.Context, graphJSON []byte) error {
 	return nil
 }
 
-func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContext, node GenericNode) error {
+func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContext, node GenericNode, useMerge bool) error {
 	// Build labels string
 	labels := ""
 	for i, label := range node.Labels {
@@ -93,20 +94,43 @@ func (c *Client) createNode(ctx context.Context, session neo4j.SessionWithContex
 	// Get merged properties (includes name, fqn, etc.)
 	props := node.ToProperties()
 
-	query := fmt.Sprintf("CREATE (n:%s $props)", labels)
-	_, err := session.Run(ctx, query, map[string]any{"props": props})
+	var query string
+	if useMerge {
+		// MERGE by FQN if available, otherwise by ID
+		if fqn, ok := props["fqn"].(string); ok && fqn != "" {
+			query = fmt.Sprintf("MERGE (n:%s {fqn: $fqn}) SET n += $props", labels)
+			props["fqn"] = fqn // ensure fqn is in props
+		} else {
+			query = fmt.Sprintf("MERGE (n:%s {id: $id}) SET n += $props", labels)
+		}
+	} else {
+		query = fmt.Sprintf("CREATE (n:%s $props)", labels)
+	}
+	
+	_, err := session.Run(ctx, query, map[string]any{"props": props, "fqn": props["fqn"], "id": props["id"]})
 	return err
 }
 
-func (c *Client) createRelationship(ctx context.Context, session neo4j.SessionWithContext, rel GraphRelationship) error {
-	query := `
-		MATCH (a {id: $startId}), (b {id: $endId})
-		CREATE (a)-[r:` + rel.Type + ` $props]->(b)
-	`
+func (c *Client) createRelationship(ctx context.Context, session neo4j.SessionWithContext, rel GraphRelationship, useMerge bool) error {
 	props := make(map[string]any)
 	props["id"] = rel.ID
 	for k, v := range rel.Properties {
 		props[k] = v
+	}
+
+	var query string
+	if useMerge {
+		// MERGE relationship by matching start/end nodes
+		query = `
+			MATCH (a {id: $startId}), (b {id: $endId})
+			MERGE (a)-[r:` + rel.Type + `]->(b)
+			SET r += $props
+		`
+	} else {
+		query = `
+			MATCH (a {id: $startId}), (b {id: $endId})
+			CREATE (a)-[r:` + rel.Type + ` $props]->(b)
+		`
 	}
 
 	_, err := session.Run(ctx, query, map[string]any{
