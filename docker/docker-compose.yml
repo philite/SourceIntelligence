@@ -1,4 +1,27 @@
 services:
+  # Kotlin Analyzer - gRPC server for code analysis
+  analyzer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.analyzer
+    container_name: analyzer-server
+    ports:
+      - "50051:50051"
+    volumes:
+      # Mount the SourceIntelligence directory so all projects are accessible
+      # Inside container: /projects/testdata/kickstarter
+      - C:/Users/Phil/Documents/Playground/SourceIntelligence:/projects:ro
+    environment:
+      - GRPC_PORT=50051
+      - JAVA_OPTS=-Xmx4g -XX:+UseG1GC
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
   memgraph:
     image: memgraph/memgraph-mage:latest
     container_name: memgraph-db

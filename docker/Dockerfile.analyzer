@@ -1,0 +1,49 @@
+# Build stage - compile the Kotlin analyzer
+FROM eclipse-temurin:21-jdk AS builder
+
+WORKDIR /app
+
+# Copy Gradle wrapper and build files first (for better caching)
+COPY analyzer/gradlew ./
+COPY analyzer/gradle/ ./gradle/
+COPY analyzer/build.gradle.kts ./
+COPY analyzer/settings.gradle.kts ./
+COPY proto/analyzer.proto ../proto/
+
+# Make gradlew executable
+RUN chmod +x ./gradlew
+
+# Download dependencies first (cacheable layer)
+RUN ./gradlew dependencies --no-daemon || true
+
+# Copy source code
+COPY analyzer/src/ ./src/
+
+# Build the distribution
+RUN ./gradlew installDist --no-daemon
+
+# Runtime stage - minimal image for running the server
+FROM eclipse-temurin:21-jre
+
+WORKDIR /app
+
+# Copy the built distribution
+COPY --from=builder /app/build/install/sourceintel-analyzer ./
+
+# Expose gRPC port
+EXPOSE 50051
+
+# Health check (simple port check)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD nc -z localhost 50051 || exit 1
+
+# Set environment variables
+ENV JAVA_OPTS="-Xmx4g -XX:+UseG1GC"
+
+# Create entry point script for server mode
+RUN echo '#!/bin/sh' > /app/start-server.sh && \
+    echo 'exec ./bin/sourceintel-analyzer server --port ${GRPC_PORT:-50051}' >> /app/start-server.sh && \
+    chmod +x /app/start-server.sh
+
+# Run the gRPC server
+ENTRYPOINT ["/app/start-server.sh"]

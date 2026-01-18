@@ -4,9 +4,11 @@ import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.core.main
 import com.github.ajalt.clikt.core.subcommands
 import com.github.ajalt.clikt.parameters.arguments.argument
+import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.multiple
 import com.github.ajalt.clikt.parameters.options.option
+import com.github.ajalt.clikt.parameters.types.int
 import com.github.ajalt.clikt.parameters.types.path
 import com.sourceintel.analyzer.k2.ClasspathConfig
 import com.sourceintel.analyzer.k2.K2Analyzer
@@ -55,6 +57,8 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
     private val excludeLib by option("--exclude-lib", help = "Exclude libraries matching glob pattern (repeatable)")
         .multiple()
     
+    private val shard by option("--shard", help = "Shard format 'index/total' (e.g., '0/4' for first of 4 shards). Zero-indexed.")
+    
     override fun run() {
         logger.info { "Analyzing project: $projectPath (fullK2=$fullK2, semantic=$semantic, android=$android)" }
         
@@ -78,7 +82,14 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
                 
                 if (kotlinVersion == null || kotlinVersion.isK2Compatible()) {
                     logger.info { "Using full K2 FIR analysis (Kotlin ${kotlinVersion ?: "unknown, assuming 2.0+"})" }
-                    K2FullAnalyzer(projectPath, config).analyze(moduleName)
+                    
+                    // Parse sharding
+                    val (shardIndex, totalShards) = parseShard(shard)
+                    if (totalShards > 1) {
+                        logger.info { "Sharding enabled: processing shard $shardIndex of $totalShards" }
+                    }
+                    
+                    K2FullAnalyzer(projectPath, config, shardIndex, totalShards).analyze(moduleName)
                 } else {
                     logger.info { "Project uses Kotlin $kotlinVersion (< 2.0) - using PSI semantic analysis instead of K2 FIR" }
                     K2SemanticAnalyzer(projectPath).analyze(moduleName)
@@ -125,9 +136,47 @@ class AnalyzeCommand : CliktCommand(name = "analyze") {
     }
 }
 
+/**
+ * Parse shard specification string "index/total" into pair.
+ * Returns (0, 1) if null or invalid (meaning no sharding).
+ */
+private fun parseShard(shardSpec: String?): Pair<Int, Int> {
+    if (shardSpec == null) return 0 to 1
+    
+    val parts = shardSpec.split("/")
+    if (parts.size != 2) {
+        logger.warn { "Invalid shard format '$shardSpec', expected 'index/total'. Ignoring sharding." }
+        return 0 to 1
+    }
+    
+    val index = parts[0].toIntOrNull()
+    val total = parts[1].toIntOrNull()
+    
+    if (index == null || total == null || index < 0 || total < 1 || index >= total) {
+        logger.warn { "Invalid shard values in '$shardSpec'. Index must be 0 <= index < total. Ignoring sharding." }
+        return 0 to 1
+    }
+    
+    return index to total
+}
+
+/**
+ * Server command to start the gRPC analyzer server
+ */
+class ServerCommand : CliktCommand(name = "server") {
+    private val port by option("-p", "--port", help = "gRPC server port")
+        .int()
+        .default(50051)
+    
+    override fun run() {
+        logger.info { "Starting AnalyzerServer on port $port" }
+        com.sourceintel.analyzer.grpc.AnalyzerServer(port).start()
+    }
+}
+
 fun main(args: Array<String>) {
     AnalyzerCli()
-        .subcommands(AnalyzeCommand())
+        .subcommands(AnalyzeCommand(), ServerCommand())
         .main(args)
 }
 

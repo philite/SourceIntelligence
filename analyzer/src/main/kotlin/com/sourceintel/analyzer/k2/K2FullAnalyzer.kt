@@ -34,7 +34,9 @@ private val logger = KotlinLogging.logger {}
  */
 class K2FullAnalyzer(
     private val projectPath: Path,
-    private val classpathConfig: ClasspathConfig = ClasspathConfig.DEFAULT
+    private val classpathConfig: ClasspathConfig = ClasspathConfig.DEFAULT,
+    private val shardIndex: Int = 0,
+    private val totalShards: Int = 1
 ) {
     private var nodeIdCounter = 0
     private val nodesByFqn = mutableMapOf<String, String>()
@@ -108,18 +110,29 @@ class K2FullAnalyzer(
 
             for (ktFile in ktFiles) {
                 processedCount++
-                if (processedCount % 10 == 0 || processedCount == totalFiles) {
-                    val percent = (processedCount * 100) / totalFiles
-                    logger.info { "Analyzing $processedCount/$totalFiles ($percent%) - ${ktFile.name}" }
+                
+                // Sharding: skip files not assigned to this shard
+                if (totalShards > 1 && (processedCount - 1) % totalShards != shardIndex) {
+                    continue
                 }
                 
-                // Synchronous analysis - no async timeout to avoid zombie threads holding K2 locks
+                // VERBOSE LOGGING: Log BEFORE analysis to identify hanging files
+                val filePath = ktFile.virtualFilePath
+                logger.info { "[ENTER] Analyzing file $processedCount/$totalFiles: $filePath" }
+                
+                if (processedCount % 10 == 0 || processedCount == totalFiles) {
+                    val percent = (processedCount * 100) / totalFiles
+                    logger.info { "Progress: $processedCount/$totalFiles ($percent%)" }
+                }
+                
                 try {
                     val (fileNodes, fileRels) = analyzeFileWithK2(ktFile)
                     nodes.addAll(fileNodes)
                     relationships.addAll(fileRels)
-                } catch (e: Exception) {
-                    logger.warn { "Failed to analyze ${ktFile.name}: ${e.message}" }
+                    logger.debug { "[EXIT] Completed $filePath: ${fileNodes.size} nodes, ${fileRels.size} rels" }
+                } catch (e: Throwable) {
+                    // Catch Throwable to also capture K2 internal errors
+                    logger.warn { "[FAIL] Failed to analyze ${ktFile.name}: ${e.javaClass.simpleName} - ${e.message}" }
                 }
             }
             
@@ -200,6 +213,14 @@ class K2FullAnalyzer(
         analyze(ktFile) {
             for (declaration in ktFile.declarations) {
                 analyzeDeclarationWithK2(declaration, fileNode, packageName, nodes, relationships)
+            }
+            
+            // Koin DI analysis
+            val koinAnalyzer = KoinAnalyzer(nodesByFqn) { nextId() }
+            with(koinAnalyzer) {
+                val (koinNodes, koinRels) = analyzeKoin(ktFile, nodes)
+                nodes.addAll(koinNodes)
+                relationships.addAll(koinRels)
             }
         }
         

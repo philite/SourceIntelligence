@@ -1,0 +1,90 @@
+syntax = "proto3";
+package sourceintel;
+
+option go_package = "github.com/sourceintel/cli/pkg/proto";
+option java_package = "com.sourceintel.proto";
+option java_multiple_files = true;
+
+// AnalyzerService provides streaming code analysis
+service AnalyzerService {
+  // Server-streaming RPC: client sends request, server streams graph data incrementally
+  rpc Analyze(AnalyzeRequest) returns (stream AnalysisEvent);
+}
+
+// Request to analyze a Kotlin/Android project
+message AnalyzeRequest {
+  string project_path = 1;
+  string module_name = 2;
+  bool full_k2 = 3;
+  bool android = 4;
+  string shard = 5;  // e.g., "0/4" for sharding
+  ClasspathConfig classpath_config = 6;
+}
+
+// Configuration for classpath resolution
+message ClasspathConfig {
+  bool exclude_gradle_cache = 1;
+  bool exclude_maven_local = 2;
+  bool exclude_build_dir = 3;
+  repeated string exclude_lib_patterns = 4;
+}
+
+// Streaming event wrapper - each message is one of these types
+message AnalysisEvent {
+  oneof event {
+    GraphMeta meta = 1;
+    GraphNode node = 2;
+    GraphRelationship relationship = 3;
+    ProgressUpdate progress = 4;
+    AnalysisComplete complete = 5;
+    AnalysisError error = 6;
+  }
+}
+
+// Metadata about the analyzed project (sent first)
+message GraphMeta {
+  string language = 1;
+  string project_type = 2;
+  string schema_version = 3;
+  string analyzed_at = 4;
+  string project_path = 5;
+}
+
+// A single node in the code graph
+message GraphNode {
+  string id = 1;
+  string type = 2;  // "TypeNode", "FunctionNode", "FieldNode", etc.
+  repeated string labels = 3;
+  map<string, string> properties = 4;
+}
+
+// A relationship between two nodes
+message GraphRelationship {
+  string id = 1;
+  string type = 2;  // "CALLS", "EXTENDS", "IMPLEMENTS", etc.
+  string start_node_id = 3;
+  string end_node_id = 4;
+  map<string, string> properties = 5;
+}
+
+// Progress update during analysis
+message ProgressUpdate {
+  int32 files_processed = 1;
+  int32 total_files = 2;
+  string current_file = 3;
+}
+
+// Final message indicating analysis completion
+message AnalysisComplete {
+  int32 total_nodes = 1;
+  int32 total_relationships = 2;
+  int64 duration_ms = 3;
+}
+
+// Error information if analysis fails for a file
+message AnalysisError {
+  string message = 1;
+  string file = 2;
+  int32 line = 3;
+  bool fatal = 4;  // If true, analysis cannot continue
+}

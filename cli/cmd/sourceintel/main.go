@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/sourceintel/cli/internal/analyzer"
@@ -19,6 +20,7 @@ var (
 	memgraphUser     string
 	memgraphPassword string
 	outputFormat     string
+	analyzerGrpc     string
 )
 
 var rootCmd = &cobra.Command{
@@ -42,32 +44,66 @@ var indexCmd = &cobra.Command{
 		android, _ := cmd.Flags().GetBool("android")
 		clearFirst, _ := cmd.Flags().GetBool("clear")
 		useMerge, _ := cmd.Flags().GetBool("merge")
+		grpcAddr, _ := cmd.Flags().GetString("analyzer-grpc")
 		
 		fmt.Printf("Indexing project: %s\n", projectPath)
 		
+		var graph *memgraph.CodeGraph
+		var err error
+		
+		// Use gRPC if address provided, otherwise use subprocess
+		if grpcAddr != "" {
+			fmt.Printf("Using gRPC analyzer at %s\n", grpcAddr)
+			if fullK2 {
+				fmt.Println("Running full K2 semantic analyzer via gRPC (this may take a while)...")
+			} else {
+				fmt.Println("Running analyzer via gRPC...")
+			}
+			
+			// Create a long timeout context for analysis
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			
+			// Use path as-is if it starts with / (container path), otherwise convert to absolute
+			analyzerPath := projectPath
+			if len(projectPath) > 0 && projectPath[0] != '/' {
+				absProjectPath, err := filepath.Abs(projectPath)
+				if err != nil {
+					return fmt.Errorf("failed to resolve absolute path: %w", err)
+				}
+				analyzerPath = absProjectPath
+			}
+			
+			grpcAnalyzer := analyzer.NewGrpcAnalyzer(grpcAddr)
+			graph, err = grpcAnalyzer.AnalyzeProject(ctx, analyzerPath, moduleName, fullK2, android)
+			if err != nil {
+				return fmt.Errorf("gRPC analysis failed: %w", err)
+			}
+		} else {
+			// Auto-detect analyzer directory if not explicitly correctly set or using default
+			if analyzerDir == "../analyzer" {
+				if foundDir, err := analyzer.FindAnalyzerDir(); err == nil {
+					analyzerDir = foundDir
+				}
+			}
 
-		// Auto-detect analyzer directory if not explicitly correctly set or using default
-		if analyzerDir == "../analyzer" {
-			if foundDir, err := analyzer.FindAnalyzerDir(); err == nil {
-				analyzerDir = foundDir
+			// Create analyzer
+			a := analyzer.NewAnalyzer(analyzerDir)
+			
+			// Analyze project
+			if fullK2 {
+				fmt.Println("Running full K2 semantic analyzer (this may take a while)...")
+			} else if semantic {
+				fmt.Println("Running PSI-enhanced analyzer...")
+			} else {
+				fmt.Println("Running Kotlin analyzer...")
+			}
+			graph, err = a.AnalyzeProject(projectPath, moduleName, semantic, fullK2, android)
+			if err != nil {
+				return fmt.Errorf("analysis failed: %w", err)
 			}
 		}
-
-		// Create analyzer
-		a := analyzer.NewAnalyzer(analyzerDir)
 		
-		// Analyze project
-		if fullK2 {
-			fmt.Println("Running full K2 semantic analyzer (this may take a while)...")
-		} else if semantic {
-			fmt.Println("Running PSI-enhanced analyzer...")
-		} else {
-			fmt.Println("Running Kotlin analyzer...")
-		}
-		graph, err := a.AnalyzeProject(projectPath, moduleName, semantic, fullK2, android)
-		if err != nil {
-			return fmt.Errorf("analysis failed: %w", err)
-		}
 		fmt.Printf("Found %d nodes and %d relationships\n", len(graph.Nodes), len(graph.Relationships))
 		
 		// Connect to Memgraph
@@ -298,6 +334,7 @@ func init() {
 	indexCmd.Flags().Bool("android", false, "Run Android enrichment (layouts, manifest, navigation, Compose)")
 	indexCmd.Flags().Bool("clear", false, "Clear existing graph before indexing (prevents duplicates)")
 	indexCmd.Flags().Bool("merge", false, "Use MERGE instead of CREATE for incremental updates")
+	indexCmd.Flags().String("analyzer-grpc", "", "Analyzer gRPC server address (e.g., localhost:50051). Uses subprocess mode if empty.")
 	
 	// Find command flags
 	findCmd.Flags().String("type", "", "Filter by symbol type (e.g., ViewModel, UseCase)")
