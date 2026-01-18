@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	pb "github.com/sourceintel/cli/pkg/proto"
 )
@@ -107,13 +108,22 @@ func (e *CSVExporter) Close() {
 
 // Reuse your existing helper logic
 func protoNodeToMap(node *pb.GraphNode) map[string]any {
-    // ... (Use the implementation from your existing grpc_analyzer.go)
-    // Copy-paste that function here or make it public in a shared package
 	m := make(map[string]any)
 	m["id"] = node.Id
-	// Add other fields... 
+	m["type"] = node.Type
+	m["labels"] = node.Labels
+
 	for k, v := range node.Properties {
-		m[k] = v
+		// Convert known numeric fields to int
+		if k == "line" {
+			if lineNum, err := strconv.Atoi(v); err == nil {
+				m[k] = lineNum
+			} else {
+				m[k] = 0
+			}
+		} else {
+			m[k] = v
+		}
 	}
 	return m
 }

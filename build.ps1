@@ -14,16 +14,6 @@ Write-Host "  SourceIntelligence Build Pipeline" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Step 1: Build Kotlin Analyzer
-Write-Host "[1/4] Building Kotlin Analyzer..." -ForegroundColor Yellow
-Push-Location "$Root\analyzer"
-try {
-    & ./gradlew build -x test --quiet
-    if ($LASTEXITCODE -ne 0) { throw "Gradle build failed" }
-    Write-Host "      ✅ Analyzer built successfully" -ForegroundColor Green
-} finally {
-    Pop-Location
-}
 
 # Step 2: Build Go CLI
 Write-Host "[2/4] Building Go CLI..." -ForegroundColor Yellow

@@ -22,11 +22,6 @@ echo "  SourceIntelligence Build Pipeline"
 echo "========================================"
 echo ""
 
-# Step 1: Build Kotlin Analyzer
-echo -e "\033[33m[1/4] Building Kotlin Analyzer...\033[0m"
-cd "$ROOT/analyzer"
-./gradlew build -x test --quiet
-echo -e "      \033[32m✅ Analyzer built successfully\033[0m"
 
 # Step 2: Build Go CLI
 echo -e "\033[33m[2/4] Building Go CLI...\033[0m"

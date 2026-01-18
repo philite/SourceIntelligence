@@ -68,13 +68,12 @@ func (c *Client) ImportCSV(ctx context.Context, nodesPathInternal, relsPathInter
 	}
 
 	// 2. Import Nodes
-	// We use APOC to handle the JSON properties column and dynamic labels.
-	// NOTE: Memgraph Mage (or APOC) must be installed in your Docker image.
+	// We use json_util from MAGE to handle the JSON properties column.
 	fmt.Println("   [Memgraph] Importing Nodes from CSV...")
 	nodeQuery := fmt.Sprintf(`
 		LOAD CSV FROM "%s" WITH HEADER AS row
 		CREATE (n)
-		SET n = apoc.convert.fromJsonMap(row.properties)
+		SET n = json_util.load_from_string(row.properties)
 		SET n.id = row.id
 		WITH n, row
 		CALL apoc.create.addLabels(n, split(row.labels, ":")) YIELD node
@@ -94,7 +93,7 @@ func (c *Client) ImportCSV(ctx context.Context, nodesPathInternal, relsPathInter
 		LOAD CSV FROM "%s" WITH HEADER AS row
 		MATCH (start {id: row.start_id})
 		MATCH (end {id: row.end_id})
-		CALL apoc.create.relationship(start, row.type, apoc.convert.fromJsonMap(row.properties), end) YIELD rel
+		CALL apoc.create.relationship(start, row.type, json_util.load_from_string(row.properties), end) YIELD rel
 		RETURN count(*) as count
 	`, relsPathInternal)
 
